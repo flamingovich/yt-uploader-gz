@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background-color: #0f0f0f;
+  color: #e5e5e5;
+}
+
+/* Scrollbars: match industrial theme (Firefox + Chromium / Electron) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #333333 #141414;
+  border-radius: 0 !important;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #141414;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #333333;
+  border: 1px solid #141414;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #737373;
+}
+
+*::-webkit-scrollbar-corner {
+  background: #141414;
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
