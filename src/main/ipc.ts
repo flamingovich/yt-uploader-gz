@@ -1,6 +1,7 @@
 import { BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { randomBytes, createHash, randomUUID } from 'node:crypto'
 import { promises as fsp } from 'node:fs'
+import { createServer } from 'node:http'
 import { basename, extname, join } from 'node:path'
 import { URL } from 'node:url'
 import googleapis from 'googleapis'
@@ -16,6 +17,7 @@ import {
   getChannelById,
   getOAuthProfileById,
   getProxyById,
+  getProxyByHostPort,
   insertChannel,
   insertOAuthProfile,
   insertUploadQueueItem,
@@ -29,7 +31,9 @@ import {
   updateUploadQueueStatus,
   updateChannelPublishingSettings,
   updateChannelOAuthData,
-  updateProxyCheckStatus
+  updateChannelAdsProfileName,
+  updateProxyCheckStatus,
+  updateChannelProxyBinding
 } from '@services/db/queries'
 import { SETTINGS_KEY_LIST, SETTINGS_KEYS } from '@services/settings/keys'
 import { checkSocks5Proxy, checkSocks5UrlReachability } from '@services/proxy/checkSocks5'
@@ -55,6 +59,7 @@ import { sanitizeStreamerFsPathForDb } from '@services/stream/streamerConcat'
 import { sendTelegramNotification } from '@services/telegram/notifier'
 import { openOAuthInAppWindow } from './oauthWindow'
 import type { ProxyRow } from '@services/db/types'
+import { fetchAdsProfileSummary, startAdsProfileAndOpenUrl } from './adsPowerService'
 
 const { google } = googleapis
 
@@ -74,6 +79,9 @@ type PendingManualOAuth = {
 }
 
 const pendingManualOAuth = new Map<string, PendingManualOAuth>()
+const pendingManualOAuthByState = new Map<string, string>()
+const pendingManualOAuthCallbacks = new Map<string, string>()
+let manualOAuthCallbackServerStarted = false
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm'])
 
@@ -113,6 +121,225 @@ function getOAuthClientCredentials(channelId: number) {
   return getOAuthClientCredentialsForChannel(channelId)
 }
 
+function renderOAuthCallbackPage(message: string): string {
+  const text = message.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  return `<!doctype html><html><head><meta charset="utf-8"/><title>OAuth</title></head><body style="font-family:Arial,sans-serif;background:#111;color:#f4f4f5;padding:20px"><h3>${text}</h3><p>Можно закрыть эту вкладку и вернуться в приложение.</p></body></html>`
+}
+
+function ensureManualOAuthCallbackServer(): void {
+  if (manualOAuthCallbackServerStarted) return
+  const server = createServer((req, res) => {
+    const method = String(req.method ?? 'GET').toUpperCase()
+    const rawUrl = String(req.url ?? '/')
+    if (method !== 'GET') {
+      res.statusCode = 405
+      res.end('Method Not Allowed')
+      return
+    }
+    let parsed: URL
+    try {
+      parsed = new URL(rawUrl, 'http://127.0.0.1:53682')
+    } catch {
+      res.statusCode = 400
+      res.end('Bad Request')
+      return
+    }
+    if (parsed.pathname !== '/oauth2callback') {
+      res.statusCode = 404
+      res.end('Not Found')
+      return
+    }
+    const state = parsed.searchParams.get('state') ?? ''
+    const flowId = state ? pendingManualOAuthByState.get(state) ?? '' : ''
+    if (!flowId) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      res.end(renderOAuthCallbackPage('OAuth-сессия не найдена или устарела'))
+      return
+    }
+    pendingManualOAuthCallbacks.set(flowId, parsed.toString())
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.end(renderOAuthCallbackPage('Готово! Авторизация получена приложением'))
+  })
+  server.on('error', () => {
+    manualOAuthCallbackServerStarted = false
+  })
+  server.listen(53682, '127.0.0.1')
+  manualOAuthCallbackServerStarted = true
+}
+
+async function beginManualOAuthFlow(channelId: number): Promise<{ flowId: string; authUrl: string }> {
+  ensureManualOAuthCallbackServer()
+  const creds = getOAuthClientCredentials(channelId)
+  const state = randomBytes(24).toString('hex')
+  const pkce = createPkce()
+  const flowId = randomUUID()
+  const redirectUri = `http://127.0.0.1:53682/oauth2callback`
+  const oauth2 = new google.auth.OAuth2(creds.clientId, creds.clientSecret, redirectUri)
+  const authUrl = oauth2.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: YOUTUBE_OAUTH_SCOPES,
+    state,
+    code_challenge: pkce.challenge,
+    code_challenge_method: 'S256'
+  })
+  pendingManualOAuth.set(flowId, {
+    flowId,
+    channelId,
+    clientId: creds.clientId,
+    clientSecret: creds.clientSecret,
+    codeVerifier: pkce.verifier,
+    state,
+    redirectUri,
+    proxy: creds.proxy ?? undefined
+  })
+  pendingManualOAuthByState.set(state, flowId)
+  return { flowId, authUrl }
+}
+
+async function finishManualOAuthFlow(flowId: string, callbackUrl: string) {
+  const flow = pendingManualOAuth.get(flowId)
+  if (!flow) return { ok: false as const, error: 'OAuth-сессия устарела. Сгенерируйте новую ссылку.' }
+  try {
+    const parsed = new URL(callbackUrl)
+    const state = parsed.searchParams.get('state') ?? ''
+    const code = parsed.searchParams.get('code') ?? ''
+    const err = parsed.searchParams.get('error')
+    if (err) throw new Error(`Google вернул ошибку: ${err}`)
+    if (!code) throw new Error('В callback URL нет параметра code')
+    if (!state || state !== flow.state) throw new Error('State не совпадает, OAuth-сессия недействительна')
+
+    const oauth2 = new google.auth.OAuth2(flow.clientId, flow.clientSecret, flow.redirectUri)
+    if (flow.proxy) {
+      google.options({ agent: new SocksProxyAgent(buildSocks5Url(flow.proxy)) })
+    }
+    const tokenResp = await oauth2.getToken({ code, codeVerifier: flow.codeVerifier })
+    const accessToken = tokenResp.tokens.access_token ?? ''
+    if (!accessToken) throw new Error('Google не вернул access_token')
+    oauth2.setCredentials(tokenResp.tokens)
+
+    const yt = google.youtube({ version: 'v3', auth: oauth2 })
+    const mine = await yt.channels.list({ part: ['id', 'snippet'], mine: true })
+    const ch = mine.data.items?.[0]
+    if (!ch?.id) throw new Error('Не удалось получить канал YouTube по OAuth')
+
+    updateChannelOAuthData({
+      channelId: flow.channelId,
+      youtube_channel_id: ch.id,
+      channel_title: ch.snippet?.title ?? null,
+      oauth_access_token: accessToken,
+      oauth_refresh_token: tokenResp.tokens.refresh_token ?? null,
+      token_expires_at: tokenResp.tokens.expiry_date ? new Date(tokenResp.tokens.expiry_date).toISOString() : null
+    })
+    pendingManualOAuth.delete(flowId)
+    pendingManualOAuthByState.delete(flow.state)
+    pendingManualOAuthCallbacks.delete(flowId)
+    logEvent({
+      channel_id: flow.channelId,
+      level: 'info',
+      action_type: 'youtube_oauth_connected_manual',
+      message: `YouTube подключен вручную: ${ch.snippet?.title ?? ch.id}`
+    })
+    return {
+      ok: true as const,
+      data: {
+        channelId: flow.channelId,
+        youtube_channel_id: ch.id,
+        channel_title: ch.snippet?.title ?? 'YouTube Channel'
+      }
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    logEvent({
+      channel_id: flow.channelId,
+      level: 'error',
+      action_type: 'youtube_oauth_manual_failed',
+      message
+    })
+    return { ok: false as const, error: message }
+  }
+}
+
+async function syncChannelProxyFromAds(channelId: number): Promise<
+  | { ok: true; data: { mode: 'imported' | 'linked_existing' | 'no_proxy'; proxy_id: number | null; summary: string } }
+  | { ok: false; error: string }
+> {
+  const channel = getChannelById(channelId)
+  if (!channel) return { ok: false, error: 'Канал не найден' }
+  const adsProfileId = channel.ads_profile_id?.trim() ?? ''
+  if (!adsProfileId) return { ok: false, error: 'У канала не указан ADS profile id' }
+  const settings = getAppSettings()
+  const apiBaseUrl = String(settings[SETTINGS_KEYS.adspower_api_base_url] ?? '').trim() || 'http://local.adspower.net:50325'
+  const apiKey = String(settings[SETTINGS_KEYS.adspower_api_key] ?? '')
+  const summary = await fetchAdsProfileSummary({
+    baseUrl: apiBaseUrl,
+    apiKey,
+    profileId: adsProfileId
+  })
+  updateChannelAdsProfileName(channelId, summary.displayName)
+  const adsProxy = summary.proxy
+  if (!adsProxy) {
+    updateChannelProxyBinding(channelId, null)
+    return { ok: true, data: { mode: 'no_proxy', proxy_id: null, summary: 'В ADS для профиля стоит no_proxy' } }
+  }
+  if (adsProxy.type !== 'socks5') {
+    return { ok: false, error: `Прокси в ADS имеет тип ${adsProxy.type}. В приложении поддержан только SOCKS5.` }
+  }
+  const existing = getProxyByHostPort(adsProxy.host, adsProxy.port)
+  if (existing) {
+    updateChannelProxyBinding(channelId, existing.id)
+    return {
+      ok: true,
+      data: {
+        mode: 'linked_existing',
+        proxy_id: existing.id,
+        summary: `Привязан существующий прокси #${existing.id} (${existing.host}:${existing.port})`
+      }
+    }
+  }
+  const created = insertProxy({
+    name: summary.displayName?.trim() ? `ADS · ${summary.displayName.trim()}` : `ADS ${adsProfileId}`,
+    host: adsProxy.host,
+    port: adsProxy.port,
+    login: adsProxy.login,
+    password: adsProxy.password
+  })
+  updateChannelProxyBinding(channelId, created.id)
+  return {
+    ok: true,
+    data: {
+      mode: 'imported',
+      proxy_id: created.id,
+      summary: `Импортирован прокси #${created.id} (${adsProxy.host}:${adsProxy.port})`
+    }
+  }
+}
+
+async function hydrateMissingAdsProfileNames(): Promise<void> {
+  const channels = listChannels()
+  const missing = channels.filter((ch) => ch.ads_profile_id?.trim() && !ch.ads_profile_name?.trim())
+  if (missing.length === 0) return
+  const settings = getAppSettings()
+  const apiBaseUrl = String(settings[SETTINGS_KEYS.adspower_api_base_url] ?? '').trim() || 'http://local.adspower.net:50325'
+  const apiKey = String(settings[SETTINGS_KEYS.adspower_api_key] ?? '')
+  for (const ch of missing) {
+    const adsId = ch.ads_profile_id?.trim()
+    if (!adsId) continue
+    try {
+      const { displayName } = await fetchAdsProfileSummary({
+        baseUrl: apiBaseUrl,
+        apiKey,
+        profileId: adsId
+      })
+      if (displayName?.trim()) {
+        updateChannelAdsProfileName(ch.id, displayName.trim())
+      }
+    } catch {
+      // ignore: list should still load even if ADS API unavailable
+    }
+  }
+}
+
 function parseCompactProxy(input: string): { ok: true; data: CompactProxyInput } | { ok: false; error: string } {
   const value = input.trim()
   if (!value) return { ok: false, error: 'Пустая строка' }
@@ -139,6 +366,111 @@ function parseCompactProxy(input: string): { ok: true; data: CompactProxyInput }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function buildAiMetaPrompt(input: {
+  kind: 'description' | 'tags'
+  topic: string
+  language: string
+  category: string
+  madeForKids: boolean
+}): { system: string; user: string } {
+  if (input.kind === 'description') {
+    return {
+      system:
+        'Ты пишешь краткие SEO-friendly описания для YouTube. Верни только чистый текст описания без Markdown и без пояснений.',
+      user: [
+        `Язык: ${input.language || 'ru'}`,
+        `Категория: ${input.category || 'People & Blogs'}`,
+        `Для детей: ${input.madeForKids ? 'да' : 'нет'}`,
+        '',
+        'Задача: создай короткое описание YouTube-видео (2-4 предложения).',
+        'В конце новой строкой добавь РОВНО 3 тематических хештега.',
+        'Не добавляй ничего кроме итогового текста.',
+        '',
+        `Тема видео от пользователя: ${input.topic}`
+      ].join('\n')
+    }
+  }
+  return {
+    system:
+      'Ты генерируешь только список тегов для YouTube. Верни одну строку: теги через запятую, без объяснений.',
+    user: [
+      `Язык: ${input.language || 'ru'}`,
+      `Категория: ${input.category || 'People & Blogs'}`,
+      `Для детей: ${input.madeForKids ? 'да' : 'нет'}`,
+      '',
+      'Задача: дай релевантные SEO-теги для YouTube-видео.',
+      'Формат строго: тег1, тег2, тег3...',
+      'Максимум 450 символов итоговой строки.',
+      'Без #, без точек с запятой, без нумерации.',
+      '',
+      `Тема видео от пользователя: ${input.topic}`
+    ].join('\n')
+  }
+}
+
+function normalizeGeneratedDescription(raw: string): string {
+  const text = raw.replaceAll(/\*\*/g, '').trim()
+  const lines = text
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+  const hashtags = lines
+    .join(' ')
+    .split(/\s+/)
+    .filter((w) => w.startsWith('#'))
+    .map((w) => w.replace(/[^\p{L}\p{N}_#]/gu, ''))
+  const uniqHashtags: string[] = []
+  for (const h of hashtags) {
+    if (!h || h === '#') continue
+    if (!uniqHashtags.includes(h.toLowerCase())) uniqHashtags.push(h)
+    if (uniqHashtags.length >= 3) break
+  }
+  while (uniqHashtags.length < 3) {
+    const fallback = ['#видео', '#ютуб', '#контент'][uniqHashtags.length]!
+    if (!uniqHashtags.includes(fallback)) uniqHashtags.push(fallback)
+  }
+  const noHash = lines
+    .join('\n')
+    .replace(/(^|\s)#[\p{L}\p{N}_]+/gu, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  const clipped = noHash.length > 500 ? `${noHash.slice(0, 497).trimEnd()}...` : noHash
+  return `${clipped}\n${uniqHashtags.slice(0, 3).join(' ')}`
+}
+
+function normalizeGeneratedTags(raw: string): string {
+  const tokens = raw
+    .replaceAll('\n', ',')
+    .split(/[,;|]/)
+    .map((x) => x.replace(/^#+/, '').trim())
+    .filter(Boolean)
+  const uniq: string[] = []
+  const seen = new Set<string>()
+  for (const token of tokens) {
+    const normalized = token.replace(/\s{2,}/g, ' ')
+    const key = normalized.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    uniq.push(normalized)
+  }
+  let out = ''
+  for (const tag of uniq) {
+    const candidate = out ? `${out}, ${tag}` : tag
+    if (candidate.length > 450) break
+    out = candidate
+  }
+  return out
+}
+
+function stripPollinationsServiceTail(raw: string): string {
+  const marker = '\n---\n'
+  const idx = raw.indexOf(marker)
+  if (idx >= 0) return raw.slice(0, idx).trim()
+  const supportIdx = raw.toLowerCase().indexOf('support pollinations.ai')
+  if (supportIdx >= 0) return raw.slice(0, supportIdx).trim()
+  return raw.trim()
 }
 
 async function listVideosForUpload(rootFolder: string): Promise<string[]> {
@@ -192,56 +524,6 @@ function escapeHtml(s: string): string {
   return s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')
 }
 
-function actionLabel(action: string): string {
-  const labels: Record<string, string> = {
-    app_started: 'Приложение запущено',
-    settings_saved: 'Настройки сохранены',
-    channel_created: 'Канал добавлен',
-    proxy_created: 'Прокси добавлен',
-    proxy_created_bulk: 'Прокси добавлен (массово)',
-    proxy_check_ok: 'Прокси проверен',
-    proxy_check_fail: 'Прокси недоступен',
-    youtube_oauth_connected: 'YouTube подключен',
-    youtube_oauth_connected_manual: 'YouTube подключен (ручной режим)',
-    youtube_oauth_failed: 'Ошибка подключения YouTube',
-    youtube_oauth_manual_failed: 'Ошибка ручного OAuth',
-    upload_started: 'Старт загрузки видео',
-    upload_proxy_egress: 'Подтвержден выход через прокси',
-    upload_proxy_check_failed: 'Прокси не удалось подтвердить перед загрузкой',
-    upload_without_proxy: 'Загрузка без прокси',
-    upload_success: 'Видео загружено',
-    upload_batch_finished: 'Пакетная загрузка завершена',
-    upload_daily_limit_trim: 'Ограничение дневного лимита',
-    upload_cooldown_wait: 'Пауза между загрузками',
-    upload_failed: 'Ошибка загрузки видео',
-    channel_publish_settings_updated: 'Параметры публикации обновлены',
-    oauth_profile_created: 'OAuth-профиль создан',
-    oauth_profile_deleted: 'OAuth-профиль удален'
-  }
-  return labels[action] ?? action
-}
-
-function humanMessage(entry: {
-  action_type: string
-  message: string
-  metadata?: Record<string, unknown> | null
-}): { text: string; videoUrl?: string } {
-  if (entry.action_type === 'upload_success') {
-    const metadataVideoId = typeof entry.metadata?.video_id === 'string' ? entry.metadata.video_id : ''
-    const fallbackId = entry.message.split(':').pop()?.trim() ?? ''
-    const videoId = metadataVideoId || fallbackId
-    if (videoId) return { text: 'Видео загружено', videoUrl: `https://youtu.be/${videoId}` }
-    return { text: 'Видео загружено' }
-  }
-  if (entry.action_type === 'upload_started') {
-    const parts = entry.message.split(':')
-    const path = (parts.length > 1 ? parts.slice(1).join(':') : entry.message).trim()
-    const name = path.split(/[/\\]/).filter(Boolean).at(-1) ?? path
-    return { text: `Начали загрузку файла: ${name}` }
-  }
-  return { text: entry.message }
-}
-
 function formatLogForTelegram(entry: {
   channel_id?: number | null
   queue_id?: number | null
@@ -250,36 +532,49 @@ function formatLogForTelegram(entry: {
   message: string
   metadata?: Record<string, unknown> | null
 }): string {
-  const lvl = entry.level === 'error' ? 'ERROR' : entry.level === 'warn' ? 'WARN' : 'INFO'
-  const icon = entry.level === 'error' ? '❌' : entry.level === 'warn' ? '⚠️' : '✅'
-  const action = actionLabel(entry.action_type)
-  const msg = humanMessage(entry)
-
-  let channelLine = 'Канал: -'
-  if (entry.channel_id) {
-    const channel = getChannelById(entry.channel_id)
-    const title = channel?.channel_title?.trim() || `Канал #${entry.channel_id}`
-    const ytChannelId = channel?.youtube_channel_id?.trim() ?? ''
-    if (ytChannelId) {
-      channelLine = `Канал: <a href="https://www.youtube.com/channel/${escapeHtml(ytChannelId)}">${escapeHtml(title)}</a>`
-    } else {
-      channelLine = `Канал: ${escapeHtml(title)}`
-    }
+  if (entry.action_type === 'upload_success') {
+    const idx = Number(entry.metadata?.upload_index)
+    const total = Number(entry.metadata?.upload_total)
+    const progress = Number.isFinite(idx) && Number.isFinite(total) && total > 0 ? ` (${idx}/${total})` : ''
+    return `✅ Видео загружено${progress}`
   }
+  if (entry.action_type === 'upload_batch_finished') {
+    const uploaded = Number(entry.metadata?.uploaded_count)
+    const n = Number.isFinite(uploaded) ? uploaded : 0
+    return `✅ Пакетная загрузка завершена (${n} видео)`
+  }
+  if (entry.action_type === 'upload_failed') {
+    return `❌ Ошибка загрузки видео`
+  }
+  if (entry.action_type === 'streamer_started') {
+    const streamUrl = typeof entry.metadata?.stream_url === 'string' ? entry.metadata.stream_url.trim() : ''
+    return streamUrl ? `▶️ Стрим начался: <a href="${escapeHtml(streamUrl)}">ссылка</a>` : '▶️ Стрим начался'
+  }
+  if (entry.action_type === 'streamer_stopped') {
+    return '⏹️ Стрим закончился'
+  }
+  return ''
+}
 
-  const detailsLine = msg.videoUrl
-    ? `<b>Детали:</b> ${escapeHtml(msg.text)} - <a href="${escapeHtml(msg.videoUrl)}">ссылка на видео</a>`
-    : `<b>Детали:</b> ${escapeHtml(msg.text)}`
-
-  return [
-    `${icon} <b>${escapeHtml(action)}</b>`,
-    `<b>Уровень:</b> ${lvl}`,
-    channelLine,
-    detailsLine
-  ].join('\n')
+function shouldSendTelegram(entry: { action_type: string }): boolean {
+  return (
+    entry.action_type === 'upload_success' ||
+    entry.action_type === 'upload_batch_finished' ||
+    entry.action_type === 'upload_failed' ||
+    entry.action_type === 'streamer_started' ||
+    entry.action_type === 'streamer_stopped'
+  )
 }
 
 export function registerIpcHandlers(): void {
+  const emitDataChanged = (actionType: string): void => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send('app:dataChanged', { actionType, at: Date.now() })
+      }
+    }
+  }
+
   const logEvent = (entry: {
     channel_id?: number | null
     queue_id?: number | null
@@ -289,14 +584,18 @@ export function registerIpcHandlers(): void {
     metadata?: Record<string, unknown> | null
   }): void => {
     appendActivityLog(entry)
+    emitDataChanged(entry.action_type)
     const settings = getAppSettings()
     const botToken = settings[SETTINGS_KEYS.telegram_bot_token] ?? ''
     const chatId = settings[SETTINGS_KEYS.telegram_chat_id] ?? ''
     if (!botToken || !chatId) return
+    if (!shouldSendTelegram(entry)) return
+    const text = formatLogForTelegram(entry)
+    if (!text.trim()) return
     void sendTelegramNotification({
       botToken,
       chatId,
-      text: formatLogForTelegram(entry),
+      text,
       parseMode: 'HTML',
       disableWebPagePreview: false
     }).catch(() => {
@@ -305,7 +604,10 @@ export function registerIpcHandlers(): void {
   }
 
   ipcMain.handle('db:proxies:list', () => listProxies())
-  ipcMain.handle('db:channels:list', () => listChannels())
+  ipcMain.handle('db:channels:list', async () => {
+    await hydrateMissingAdsProfileNames()
+    return listChannels()
+  })
   ipcMain.handle('db:oauthProfiles:list', () => listOAuthProfiles())
   ipcMain.handle(
     'db:oauthProfiles:create',
@@ -409,33 +711,96 @@ export function registerIpcHandlers(): void {
       return { ok: false as const, error: 'Некорректный channelId' }
     }
     try {
-      const creds = getOAuthClientCredentials(channelId)
-      const state = randomBytes(24).toString('hex')
-      const pkce = createPkce()
-      const flowId = randomUUID()
-      const redirectUri = `http://127.0.0.1:53682/oauth2callback`
-      const oauth2 = new google.auth.OAuth2(creds.clientId, creds.clientSecret, redirectUri)
-      const authUrl = oauth2.generateAuthUrl({
-        access_type: 'offline',
-        prompt: 'consent',
-        scope: YOUTUBE_OAUTH_SCOPES,
-        state,
-        code_challenge: pkce.challenge,
-        code_challenge_method: 'S256'
-      })
-      pendingManualOAuth.set(flowId, {
-        flowId,
-        channelId,
-        clientId: creds.clientId,
-        clientSecret: creds.clientSecret,
-        codeVerifier: pkce.verifier,
-        state,
-        redirectUri,
-        proxy: creds.proxy ?? undefined
-      })
-      return { ok: true as const, data: { flowId, authUrl } }
+      return { ok: true as const, data: await beginManualOAuthFlow(channelId) }
     } catch (e) {
       return { ok: false as const, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('channels:oauthBeginManualInAds', async (_e, payload: { channelId: number }) => {
+    const channelId = Number(payload?.channelId)
+    if (!Number.isFinite(channelId) || channelId < 1) {
+      return { ok: false as const, error: 'Некорректный channelId' }
+    }
+    try {
+      const channel = getChannelById(channelId)
+      if (!channel) return { ok: false as const, error: 'Канал не найден' }
+      const adsProfileId = channel.ads_profile_id?.trim() ?? ''
+      if (!adsProfileId) {
+        return { ok: false as const, error: 'У канала не указан ADS profile id' }
+      }
+      const settings = getAppSettings()
+      const apiBaseUrl = String(settings[SETTINGS_KEYS.adspower_api_base_url] ?? '').trim() || 'http://local.adspower.net:50325'
+      const apiKey = String(settings[SETTINGS_KEYS.adspower_api_key] ?? '')
+      const syncRes = await syncChannelProxyFromAds(channelId)
+      if (syncRes.ok) {
+        logEvent({
+          channel_id: channelId,
+          level: 'info',
+          action_type: 'ads_proxy_synced',
+          message: syncRes.data.summary,
+          metadata: { proxy_id: syncRes.data.proxy_id, mode: syncRes.data.mode }
+        })
+      } else {
+        logEvent({
+          channel_id: channelId,
+          level: 'warn',
+          action_type: 'ads_proxy_sync_failed',
+          message: syncRes.error
+        })
+      }
+      const flow = await beginManualOAuthFlow(channelId)
+      await startAdsProfileAndOpenUrl({
+        baseUrl: apiBaseUrl,
+        apiKey,
+        profileId: adsProfileId,
+        url: flow.authUrl
+      })
+      logEvent({
+        channel_id: channelId,
+        level: 'info',
+        action_type: 'youtube_oauth_opened_ads',
+        message: `OAuth открыт в ADS profile ${adsProfileId}`
+      })
+      return { ok: true as const, data: flow }
+    } catch (e) {
+      return { ok: false as const, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('channels:syncProxyFromAds', async (_e, payload: { channelId: number }) => {
+    const channelId = Number(payload?.channelId)
+    if (!Number.isFinite(channelId) || channelId < 1) {
+      return { ok: false as const, error: 'Некорректный channelId' }
+    }
+    try {
+      const res = await syncChannelProxyFromAds(channelId)
+      if (!res.ok) {
+        logEvent({
+          channel_id: channelId,
+          level: 'warn',
+          action_type: 'ads_proxy_sync_failed',
+          message: res.error
+        })
+        return res
+      }
+      logEvent({
+        channel_id: channelId,
+        level: 'info',
+        action_type: 'ads_proxy_synced',
+        message: res.data.summary,
+        metadata: { proxy_id: res.data.proxy_id, mode: res.data.mode }
+      })
+      return res
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      logEvent({
+        channel_id: channelId,
+        level: 'warn',
+        action_type: 'ads_proxy_sync_failed',
+        message
+      })
+      return { ok: false as const, error: message }
     }
   })
 
@@ -444,65 +809,27 @@ export function registerIpcHandlers(): void {
     const callbackUrl = String(payload?.callbackUrl ?? '').trim()
     if (!flowId) return { ok: false as const, error: 'flowId не передан' }
     if (!callbackUrl) return { ok: false as const, error: 'Вставьте callback URL из браузера' }
-    const flow = pendingManualOAuth.get(flowId)
-    if (!flow) return { ok: false as const, error: 'OAuth-сессия устарела. Сгенерируйте новую ссылку.' }
+    return finishManualOAuthFlow(flowId, callbackUrl)
+  })
 
-    try {
-      const parsed = new URL(callbackUrl)
-      const state = parsed.searchParams.get('state') ?? ''
-      const code = parsed.searchParams.get('code') ?? ''
-      const err = parsed.searchParams.get('error')
-      if (err) throw new Error(`Google вернул ошибку: ${err}`)
-      if (!code) throw new Error('В callback URL нет параметра code')
-      if (!state || state !== flow.state) throw new Error('State не совпадает, OAuth-сессия недействительна')
-
-      const oauth2 = new google.auth.OAuth2(flow.clientId, flow.clientSecret, flow.redirectUri)
-      if (flow.proxy) {
-        google.options({ agent: new SocksProxyAgent(buildSocks5Url(flow.proxy)) })
+  ipcMain.handle('channels:oauthWaitManual', async (_e, payload: { flowId: string; timeoutMs?: number }) => {
+    const flowId = String(payload?.flowId ?? '').trim()
+    if (!flowId) return { ok: false as const, error: 'flowId не передан' }
+    const timeoutMsRaw = Number(payload?.timeoutMs ?? 180000)
+    const timeoutMs = Number.isFinite(timeoutMsRaw) ? Math.max(10_000, Math.min(900_000, timeoutMsRaw)) : 180000
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const callbackUrl = pendingManualOAuthCallbacks.get(flowId)
+      if (callbackUrl) {
+        pendingManualOAuthCallbacks.delete(flowId)
+        return finishManualOAuthFlow(flowId, callbackUrl)
       }
-      const tokenResp = await oauth2.getToken({ code, codeVerifier: flow.codeVerifier })
-      const accessToken = tokenResp.tokens.access_token ?? ''
-      if (!accessToken) throw new Error('Google не вернул access_token')
-      oauth2.setCredentials(tokenResp.tokens)
-
-      const yt = google.youtube({ version: 'v3', auth: oauth2 })
-      const mine = await yt.channels.list({ part: ['id', 'snippet'], mine: true })
-      const ch = mine.data.items?.[0]
-      if (!ch?.id) throw new Error('Не удалось получить канал YouTube по OAuth')
-
-      updateChannelOAuthData({
-        channelId: flow.channelId,
-        youtube_channel_id: ch.id,
-        channel_title: ch.snippet?.title ?? null,
-        oauth_access_token: accessToken,
-        oauth_refresh_token: tokenResp.tokens.refresh_token ?? null,
-        token_expires_at: tokenResp.tokens.expiry_date ? new Date(tokenResp.tokens.expiry_date).toISOString() : null
-      })
-      pendingManualOAuth.delete(flowId)
-      logEvent({
-        channel_id: flow.channelId,
-        level: 'info',
-        action_type: 'youtube_oauth_connected_manual',
-        message: `YouTube подключен вручную: ${ch.snippet?.title ?? ch.id}`
-      })
-      return {
-        ok: true as const,
-        data: {
-          channelId: flow.channelId,
-          youtube_channel_id: ch.id,
-          channel_title: ch.snippet?.title ?? 'YouTube Channel'
-        }
+      if (!pendingManualOAuth.has(flowId)) {
+        return { ok: false as const, error: 'OAuth-сессия устарела. Запустите привязку заново.' }
       }
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e)
-      logEvent({
-        channel_id: flow.channelId,
-        level: 'error',
-        action_type: 'youtube_oauth_manual_failed',
-        message
-      })
-      return { ok: false as const, error: message }
+      await sleep(500)
     }
+    return { ok: false as const, error: 'Таймаут ожидания OAuth callback. Можно завершить вручную через callback URL.' }
   })
 
   ipcMain.handle('channels:uploadTestVideo', async (_event, payload: { channelId: number }) => {
@@ -580,7 +907,10 @@ export function registerIpcHandlers(): void {
       let failedCount = 0
       const videoIds: string[] = []
       const appSettings = getAppSettings()
-      const cooldownSecondsRaw = Number(appSettings[SETTINGS_KEYS.upload_cooldown_seconds] ?? '20')
+      const chCd = Number(creds.channel?.upload_cooldown_seconds)
+      const fromChannel = Number.isFinite(chCd) ? chCd : NaN
+      const fallbackRaw = Number(appSettings[SETTINGS_KEYS.upload_cooldown_seconds] ?? '20')
+      const cooldownSecondsRaw = Number.isFinite(fromChannel) ? fromChannel : fallbackRaw
       const cooldownSeconds = Number.isFinite(cooldownSecondsRaw) ? Math.max(0, Math.min(3600, cooldownSecondsRaw)) : 20
 
       for (let idx = 0; idx < selected.length; idx += 1) {
@@ -647,7 +977,7 @@ export function registerIpcHandlers(): void {
             level: 'info',
             action_type: 'upload_success',
             message: `Видео загружено: ${uploaded.videoId}`,
-            metadata: { video_id: uploaded.videoId, moved_to: movedTo }
+            metadata: { video_id: uploaded.videoId, moved_to: movedTo, upload_index: idx + 1, upload_total: selected.length }
           })
         } catch (fileError) {
           failedCount += 1
@@ -682,7 +1012,8 @@ export function registerIpcHandlers(): void {
         channel_id: channelId,
         level: 'info',
         action_type: 'upload_batch_finished',
-        message: `Пакет завершен: успешно ${uploadedCount}, ошибок ${failedCount}, сегодня ${usedNow}/${DAILY_LIMIT}`
+        message: `Пакет завершен: успешно ${uploadedCount}, ошибок ${failedCount}, сегодня ${usedNow}/${DAILY_LIMIT}`,
+        metadata: { uploaded_count: uploadedCount, failed_count: failedCount }
       })
 
       return {
@@ -744,6 +1075,66 @@ export function registerIpcHandlers(): void {
     logEvent({ level: 'info', action_type: 'settings_saved', message: 'Настройки сохранены' })
     return { ok: true as const }
   })
+
+  ipcMain.handle(
+    'ai:generateChannelMeta',
+    async (
+      _e,
+      payload: {
+        channelId?: number
+        kind: 'description' | 'tags'
+        topicPrompt: string
+        language?: string
+        category?: string
+        madeForKids?: boolean
+      }
+    ) => {
+      const kind = payload?.kind === 'tags' ? 'tags' : 'description'
+      const topicPrompt = String(payload?.topicPrompt ?? '').trim()
+      if (!topicPrompt) return { ok: false as const, error: 'Введите тему/промт для генерации' }
+      const prompt = buildAiMetaPrompt({
+        kind,
+        topic: topicPrompt,
+        language: String(payload?.language ?? 'ru').trim() || 'ru',
+        category: String(payload?.category ?? '').trim() || 'People & Blogs',
+        madeForKids: Boolean(payload?.madeForKids)
+      })
+      try {
+        const res = await fetch(`https://text.pollinations.ai/${encodeURIComponent(prompt.user)}`, {
+          method: 'GET',
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept: 'text/plain,application/json;q=0.9,*/*;q=0.8'
+          }
+        })
+        if (!res.ok) {
+          const body = await res.text()
+          throw new Error(`AI text endpoint HTTP ${res.status}: ${body.slice(0, 220)}`)
+        }
+        const raw = stripPollinationsServiceTail(await res.text())
+        if (!raw) throw new Error('AI вернул пустой ответ')
+        const output = kind === 'description' ? normalizeGeneratedDescription(raw) : normalizeGeneratedTags(raw)
+        if (!output) throw new Error('Не удалось нормализовать ответ AI')
+        logEvent({
+          channel_id: Number.isFinite(Number(payload?.channelId)) ? Number(payload?.channelId) : null,
+          level: 'info',
+          action_type: 'ai_meta_generated',
+          message: `Сгенерированы ${kind === 'description' ? 'описание' : 'теги'}`
+        })
+        return { ok: true as const, data: { text: output, kind } }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e)
+        logEvent({
+          channel_id: Number.isFinite(Number(payload?.channelId)) ? Number(payload?.channelId) : null,
+          level: 'warn',
+          action_type: 'ai_meta_generate_failed',
+          message
+        })
+        return { ok: false as const, error: message }
+      }
+    }
+  )
 
   ipcMain.handle(
     'proxy:check',
@@ -901,11 +1292,12 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'db:channels:create',
-    (
+    async (
       _e,
       payload: {
         proxy_id?: number | null
         oauth_profile_id?: number | null
+        ads_profile_id?: string | null
         channel_title: string
         source_folder_path?: string | null
       }
@@ -932,14 +1324,38 @@ export function registerIpcHandlers(): void {
       const { id } = insertChannel({
         proxy_id: proxyId,
         oauth_profile_id: oauthProfileId,
+        ads_profile_id: payload?.ads_profile_id ?? null,
         channel_title: title,
         source_folder_path: payload?.source_folder_path ?? null
       })
+      const adsTrim = String(payload?.ads_profile_id ?? '').trim()
+      if (adsTrim) {
+        try {
+          const settings = getAppSettings()
+          const apiBaseUrl =
+            String(settings[SETTINGS_KEYS.adspower_api_base_url] ?? '').trim() ||
+            'http://local.adspower.net:50325'
+          const apiKey = String(settings[SETTINGS_KEYS.adspower_api_key] ?? '')
+          const { displayName } = await fetchAdsProfileSummary({
+            baseUrl: apiBaseUrl,
+            apiKey,
+            profileId: adsTrim
+          })
+          updateChannelAdsProfileName(id, displayName)
+        } catch {
+          /* имя из ADS не обязательно для создания канала */
+        }
+      }
       logEvent({
         level: 'info',
         action_type: 'channel_created',
         message: `Канал добавлен: ${title}`,
-        metadata: { channel_id: id, proxy_id: proxyId, oauth_profile_id: oauthProfileId }
+        metadata: {
+          channel_id: id,
+          proxy_id: proxyId,
+          oauth_profile_id: oauthProfileId,
+          ads_profile_id: payload?.ads_profile_id ?? null
+        }
       })
       return { ok: true, data: { id } } satisfies CreateResult<{ id: number }>
     }
@@ -966,7 +1382,7 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'db:channels:updatePublishing',
-    (
+    async (
       _e,
       payload: {
         channelId: number
@@ -983,6 +1399,8 @@ export function registerIpcHandlers(): void {
         schedule_randomize_minutes?: number
         schedule_timezone?: string
         source_folder_path?: string | null
+        upload_cooldown_seconds?: number
+        ads_profile_id?: string | null
       }
     ) => {
       const channelId = Number(payload?.channelId)
@@ -1007,6 +1425,38 @@ export function registerIpcHandlers(): void {
       const category = String(payload?.default_category_id ?? '22').trim() || '22'
       const language = String(payload?.default_language ?? 'ru').trim() || 'ru'
       const timezone = String(payload?.schedule_timezone ?? 'Europe/Moscow').trim() || 'Europe/Moscow'
+      const cdRaw = Number(payload?.upload_cooldown_seconds)
+      const uploadCooldownSeconds = Number.isFinite(cdRaw)
+        ? Math.max(0, Math.min(3600, Math.floor(cdRaw)))
+        : Math.max(0, Math.min(3600, Number(existing.upload_cooldown_seconds) || 20))
+
+      const newAdsId = String(payload?.ads_profile_id ?? '').trim() || null
+      const prevAdsId = existing.ads_profile_id?.trim() ?? ''
+      const prevName = existing.ads_profile_name?.trim() ?? ''
+      let adsProfileName: string | null = prevName || null
+      if (!newAdsId) {
+        adsProfileName = null
+      } else {
+        const idChanged = newAdsId !== prevAdsId
+        const nameMissing = !prevName
+        if (idChanged || nameMissing) {
+          try {
+            const settings = getAppSettings()
+            const apiBaseUrl =
+              String(settings[SETTINGS_KEYS.adspower_api_base_url] ?? '').trim() ||
+              'http://local.adspower.net:50325'
+            const apiKey = String(settings[SETTINGS_KEYS.adspower_api_key] ?? '')
+            const { displayName } = await fetchAdsProfileSummary({
+              baseUrl: apiBaseUrl,
+              apiKey,
+              profileId: newAdsId
+            })
+            adsProfileName = displayName?.trim() || null
+          } catch {
+            adsProfileName = idChanged ? null : prevName || null
+          }
+        }
+      }
 
       updateChannelPublishingSettings({
         channel_id: channelId,
@@ -1022,7 +1472,10 @@ export function registerIpcHandlers(): void {
         schedule_window_end_hour: endHour,
         schedule_randomize_minutes: randomMins,
         schedule_timezone: timezone,
-        source_folder_path: sourceFolderPath
+        source_folder_path: sourceFolderPath,
+        upload_cooldown_seconds: uploadCooldownSeconds,
+        ads_profile_id: newAdsId,
+        ads_profile_name: adsProfileName
       })
       logEvent({
         channel_id: channelId,
@@ -1115,6 +1568,7 @@ export function registerIpcHandlers(): void {
         overlay_path?: string | null
         segments_folder_path?: string | null
         bumper_video_path?: string | null
+        bumper_pad_target_sec?: number | null
         ffmpeg_extra_args?: string | null
         youtube_broadcast_id?: string | null
         broadcast_title?: string | null
@@ -1123,6 +1577,10 @@ export function registerIpcHandlers(): void {
         broadcast_privacy?: string
         broadcast_category_id?: string
         broadcast_thumb_path?: string | null
+        minecraft_prewarm_enabled?: number | boolean
+        minecraft_prewarm_chunks_folder?: string | null
+        minecraft_prewarm_audio_folder?: string | null
+        minecraft_prewarm_music_path?: string | null
       }
     ) => {
       const id = Number(payload?.id)
@@ -1149,6 +1607,14 @@ export function registerIpcHandlers(): void {
       if (payload.bumper_video_path !== undefined) {
         patch.bumper_video_path = sanitizeStreamerFsPathForDb(payload.bumper_video_path ?? null)
       }
+      if (payload.bumper_pad_target_sec !== undefined) {
+        const raw = payload.bumper_pad_target_sec
+        if (raw === null) patch.bumper_pad_target_sec = null
+        else {
+          const n = Number(raw)
+          patch.bumper_pad_target_sec = Number.isFinite(n) ? n : null
+        }
+      }
       if (payload.ffmpeg_extra_args !== undefined) patch.ffmpeg_extra_args = payload.ffmpeg_extra_args?.trim() || null
       if (payload.youtube_broadcast_id !== undefined) {
         patch.youtube_broadcast_id = payload.youtube_broadcast_id?.trim() || null
@@ -1167,6 +1633,25 @@ export function registerIpcHandlers(): void {
       }
       if (payload.broadcast_thumb_path !== undefined) {
         patch.broadcast_thumb_path = sanitizeStreamerFsPathForDb(payload.broadcast_thumb_path ?? null)
+      }
+      if (payload.minecraft_prewarm_enabled !== undefined) {
+        const v = payload.minecraft_prewarm_enabled
+        patch.minecraft_prewarm_enabled = v === true || v === 1 ? 1 : 0
+      }
+      if (payload.minecraft_prewarm_chunks_folder !== undefined) {
+        patch.minecraft_prewarm_chunks_folder = sanitizeStreamerFsPathForDb(
+          payload.minecraft_prewarm_chunks_folder ?? null
+        )
+      }
+      if (payload.minecraft_prewarm_audio_folder !== undefined) {
+        patch.minecraft_prewarm_audio_folder = sanitizeStreamerFsPathForDb(
+          payload.minecraft_prewarm_audio_folder ?? null
+        )
+      }
+      if (payload.minecraft_prewarm_music_path !== undefined) {
+        patch.minecraft_prewarm_music_path = sanitizeStreamerFsPathForDb(
+          payload.minecraft_prewarm_music_path ?? null
+        )
       }
       updateStreamer(id, patch)
       if (existing.process_status === 'error') {
@@ -1207,12 +1692,14 @@ export function registerIpcHandlers(): void {
     }
     const r = await startStreamer(streamerId)
     if (r.ok) {
+      const row = getStreamerById(streamerId)
+      const streamUrl = row?.youtube_broadcast_id?.trim() ? `https://www.youtube.com/watch?v=${row.youtube_broadcast_id.trim()}` : null
       logEvent({
-        channel_id: getStreamerById(streamerId)?.channel_id ?? null,
+        channel_id: row?.channel_id ?? null,
         level: 'info',
         action_type: 'streamer_started',
         message: `Запуск стримера #${streamerId}`,
-        metadata: { streamer_id: streamerId }
+        metadata: { streamer_id: streamerId, stream_url: streamUrl }
       })
     }
     return r

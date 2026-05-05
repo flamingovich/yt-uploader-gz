@@ -7,13 +7,18 @@ import {
   migrateToV3IfNeeded,
   migrateToV4IfNeeded,
   migrateToV5IfNeeded,
-  migrateToV6IfNeeded
+  migrateToV6IfNeeded,
+  migrateToV7IfNeeded,
+  migrateToV8IfNeeded,
+  migrateToV9IfNeeded,
+  migrateToV10IfNeeded,
+  migrateToV11IfNeeded
 } from './migrate'
 
 let db: Database.Database | null = null
 
 /** Целевая версия миграций (см. migrate.ts). */
-export const SCHEMA_VERSION = 6
+export const SCHEMA_VERSION = 11
 
 export function getDb(): Database.Database {
   if (!db) {
@@ -40,6 +45,11 @@ export function initDatabase(dbPath: string): Database.Database {
   migrateToV4IfNeeded(instance)
   migrateToV5IfNeeded(instance)
   migrateToV6IfNeeded(instance)
+  migrateToV7IfNeeded(instance)
+  migrateToV8IfNeeded(instance)
+  migrateToV9IfNeeded(instance)
+  migrateToV10IfNeeded(instance)
+  migrateToV11IfNeeded(instance)
   if (!hasMigration(instance, SCHEMA_VERSION)) {
     instance.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(SCHEMA_VERSION)
   }

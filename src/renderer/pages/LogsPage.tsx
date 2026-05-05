@@ -102,6 +102,13 @@ export function LogsPage(): JSX.Element {
     void reload()
   }, [reload])
 
+  useEffect(() => {
+    const unsubscribe = window.electronAPI.onDataChanged(() => {
+      void reload()
+    })
+    return unsubscribe
+  }, [reload])
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <div className="flex items-center justify-between border border-industrial-border bg-industrial-panel px-3 py-2 text-xs">

@@ -9,6 +9,23 @@ type StreamerRow = StreamerListItem
 type ChannelRow = Awaited<ReturnType<typeof window.electronAPI.db.listChannels>>[number]
 type ProxyRow = Awaited<ReturnType<typeof window.electronAPI.db.listProxies>>[number]
 
+function bumperPadTargetSecFromForm(props: {
+  bumperPadMode: 'legacy' | 'once' | 'custom'
+  bumperPadAmount: number
+  bumperPadUnit: 'sec' | 'min'
+}): number | null {
+  if (props.bumperPadMode === 'legacy') return null
+  if (props.bumperPadMode === 'once') return 0
+  const n = Math.max(1, Math.floor(Number(props.bumperPadAmount) || 1))
+  const mult = props.bumperPadUnit === 'min' ? 60 : 1
+  const sec = n * mult
+  if (!Number.isFinite(sec) || sec < 1) return null
+  return Math.min(sec, 24 * 3600)
+}
+
+const BUMPER_AMOUNT_OPTIONS_SEC = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 600, 900, 1200]
+const BUMPER_AMOUNT_OPTIONS_MIN = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60]
+
 function statusLabel(s: string): string {
   switch (s) {
     case 'stopped':
@@ -49,6 +66,14 @@ export function StreamersPage(): JSX.Element {
   const [bPrivacy, setBPrivacy] = useState<'private' | 'public' | 'unlisted'>('private')
   const [bCategory, setBCategory] = useState('22')
   const [bThumbPath, setBThumbPath] = useState('')
+  /** legacy | once | custom (тогда считаем из bumperPadAmount + bumperPadUnit) */
+  const [bumperPadMode, setBumperPadMode] = useState<'legacy' | 'once' | 'custom'>('legacy')
+  const [bumperPadAmount, setBumperPadAmount] = useState(3)
+  const [bumperPadUnit, setBumperPadUnit] = useState<'sec' | 'min'>('min')
+  const [mcPrewarmEnabled, setMcPrewarmEnabled] = useState(false)
+  const [mcChunksDir, setMcChunksDir] = useState('')
+  const [mcAudioDir, setMcAudioDir] = useState('')
+  const [mcMusicPath, setMcMusicPath] = useState('')
 
   const reload = useCallback(async () => {
     const [s, ch, pr] = await Promise.all([
@@ -66,8 +91,10 @@ export function StreamersPage(): JSX.Element {
   }, [reload])
 
   useEffect(() => {
-    const t = setInterval(() => void reload(), 2000)
-    return () => clearInterval(t)
+    const unsubscribe = window.electronAPI.onDataChanged(() => {
+      void reload()
+    })
+    return unsubscribe
   }, [reload])
 
   function resetForm(): void {
@@ -88,6 +115,13 @@ export function StreamersPage(): JSX.Element {
     setBPrivacy('private')
     setBCategory('22')
     setBThumbPath('')
+    setBumperPadMode('legacy')
+    setBumperPadAmount(3)
+    setBumperPadUnit('min')
+    setMcPrewarmEnabled(false)
+    setMcChunksDir('')
+    setMcAudioDir('')
+    setMcMusicPath('')
   }
 
   function openCreate(): void {
@@ -123,6 +157,27 @@ export function StreamersPage(): JSX.Element {
       )
       setBCategory(r.broadcast_category_id || '22')
       setBThumbPath(r.broadcast_thumb_path ?? '')
+      {
+        const sec = r.bumper_pad_target_sec
+        if (sec == null) {
+          setBumperPadMode('legacy')
+        } else if (sec === 0) {
+          setBumperPadMode('once')
+        } else {
+          setBumperPadMode('custom')
+          if (sec % 60 === 0 && sec >= 60 && sec <= 7200) {
+            setBumperPadUnit('min')
+            setBumperPadAmount(Math.round(sec / 60))
+          } else {
+            setBumperPadUnit('sec')
+            setBumperPadAmount(sec)
+          }
+        }
+      }
+      setMcPrewarmEnabled(Number(r.minecraft_prewarm_enabled) === 1)
+      setMcChunksDir(r.minecraft_prewarm_chunks_folder ?? '')
+      setMcAudioDir(r.minecraft_prewarm_audio_folder ?? '')
+      setMcMusicPath(r.minecraft_prewarm_music_path ?? '')
       setShowForm(true)
     } finally {
       setBusyId(null)
@@ -185,6 +240,20 @@ export function StreamersPage(): JSX.Element {
           setBCategory={setBCategory}
           bThumbPath={bThumbPath}
           setBThumbPath={setBThumbPath}
+          bumperPadMode={bumperPadMode}
+          setBumperPadMode={setBumperPadMode}
+          bumperPadAmount={bumperPadAmount}
+          setBumperPadAmount={setBumperPadAmount}
+          bumperPadUnit={bumperPadUnit}
+          setBumperPadUnit={setBumperPadUnit}
+          mcPrewarmEnabled={mcPrewarmEnabled}
+          setMcPrewarmEnabled={setMcPrewarmEnabled}
+          mcChunksDir={mcChunksDir}
+          setMcChunksDir={setMcChunksDir}
+          mcAudioDir={mcAudioDir}
+          setMcAudioDir={setMcAudioDir}
+          mcMusicPath={mcMusicPath}
+          setMcMusicPath={setMcMusicPath}
           channels={channels}
           proxies={proxies}
           busyId={busyId}
@@ -397,6 +466,20 @@ function StreamerEditorForm(props: {
   setBCategory: (v: string) => void
   bThumbPath: string
   setBThumbPath: (v: string) => void
+  bumperPadMode: 'legacy' | 'once' | 'custom'
+  setBumperPadMode: (v: 'legacy' | 'once' | 'custom') => void
+  bumperPadAmount: number
+  setBumperPadAmount: (v: number) => void
+  bumperPadUnit: 'sec' | 'min'
+  setBumperPadUnit: (v: 'sec' | 'min') => void
+  mcPrewarmEnabled: boolean
+  setMcPrewarmEnabled: (v: boolean) => void
+  mcChunksDir: string
+  setMcChunksDir: (v: string) => void
+  mcAudioDir: string
+  setMcAudioDir: (v: string) => void
+  mcMusicPath: string
+  setMcMusicPath: (v: string) => void
   channels: ChannelRow[]
   proxies: ProxyRow[]
   busyId: number | 'save' | null
@@ -457,7 +540,12 @@ function StreamerEditorForm(props: {
           broadcast_tags: props.bTags.trim() || null,
           broadcast_privacy: props.bPrivacy,
           broadcast_category_id: props.bCategory.trim() || '22',
-          broadcast_thumb_path: props.bThumbPath.trim() || null
+          broadcast_thumb_path: props.bThumbPath.trim() || null,
+          bumper_pad_target_sec: bumperPadTargetSecFromForm(props),
+          minecraft_prewarm_enabled: props.mcPrewarmEnabled ? 1 : 0,
+          minecraft_prewarm_chunks_folder: props.mcChunksDir.trim() || null,
+          minecraft_prewarm_audio_folder: props.mcAudioDir.trim() || null,
+          minecraft_prewarm_music_path: props.mcMusicPath.trim() || null
         })
         if (!up.ok) props.setError(up.error)
         else await props.onSaved()
@@ -479,7 +567,12 @@ function StreamerEditorForm(props: {
           broadcast_tags: props.bTags.trim() || null,
           broadcast_privacy: props.bPrivacy,
           broadcast_category_id: props.bCategory.trim() || '22',
-          broadcast_thumb_path: props.bThumbPath.trim() || null
+          broadcast_thumb_path: props.bThumbPath.trim() || null,
+          bumper_pad_target_sec: bumperPadTargetSecFromForm(props),
+          minecraft_prewarm_enabled: props.mcPrewarmEnabled ? 1 : 0,
+          minecraft_prewarm_chunks_folder: props.mcChunksDir.trim() || null,
+          minecraft_prewarm_audio_folder: props.mcAudioDir.trim() || null,
+          minecraft_prewarm_music_path: props.mcMusicPath.trim() || null
         })
         if (!up.ok) props.setError(up.error)
         else await props.onSaved()
@@ -565,6 +658,11 @@ function StreamerEditorForm(props: {
         </label>
         <label className="flex flex-col gap-1 md:col-span-2">
           <span className="text-industrial-muted">Папка с кусками (видео)</span>
+          {props.mcPrewarmEnabled ? (
+            <span className="text-[10px] text-industrial-dim">
+              При включённом «Майнкрафт прогрев» эта папка не используется для эфира — берётся отдельная ниже.
+            </span>
+          ) : null}
           <div className="flex gap-2">
             <input
               readOnly
@@ -604,9 +702,74 @@ function StreamerEditorForm(props: {
               …
             </button>
           </div>
+          <div className="mt-2 flex flex-col gap-2 rounded border border-industrial-border/60 bg-industrial-bg/40 p-2">
+            <span className="text-[10px] text-industrial-dim">
+              Как долго крутить заглушку перед основным циклом (если файл короче — зацикливается до указанного срока).
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={props.bumperPadMode}
+                onChange={(e) => props.setBumperPadMode(e.target.value as 'legacy' | 'once' | 'custom')}
+                className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
+              >
+                <option value="legacy">Авто (до 3 мин, если ролик короче 3 мин)</option>
+                <option value="once">Один проигрыв — по длине файла</option>
+                <option value="custom">Задать длительность</option>
+              </select>
+              {props.bumperPadMode === 'custom' ? (
+                <>
+                  <select
+                    value={String(props.bumperPadAmount)}
+                    onChange={(e) => props.setBumperPadAmount(Number(e.target.value))}
+                    className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
+                  >
+                    {(() => {
+                      const opts =
+                        props.bumperPadUnit === 'min' ? BUMPER_AMOUNT_OPTIONS_MIN : BUMPER_AMOUNT_OPTIONS_SEC
+                      const ok = opts.includes(props.bumperPadAmount)
+                      return (
+                        <>
+                          {!ok ? (
+                            <option value={String(props.bumperPadAmount)}>
+                              {props.bumperPadAmount} ({props.bumperPadUnit === 'min' ? 'мин' : 'сек'}, из сохранённых)
+                            </option>
+                          ) : null}
+                          {opts.map((n) => (
+                            <option key={n} value={String(n)}>
+                              {n}
+                            </option>
+                          ))}
+                        </>
+                      )
+                    })()}
+                  </select>
+                  <select
+                    value={props.bumperPadUnit}
+                    onChange={(e) => {
+                      const u = e.target.value as 'sec' | 'min'
+                      props.setBumperPadUnit(u)
+                      const opts = u === 'min' ? BUMPER_AMOUNT_OPTIONS_MIN : BUMPER_AMOUNT_OPTIONS_SEC
+                      if (!opts.includes(props.bumperPadAmount)) {
+                        props.setBumperPadAmount(opts[0]!)
+                      }
+                    }}
+                    className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
+                  >
+                    <option value="sec">секунд</option>
+                    <option value="min">минут</option>
+                  </select>
+                </>
+              ) : null}
+            </div>
+          </div>
         </label>
         <label className="flex flex-col gap-1 md:col-span-2">
           <span className="text-industrial-muted">Оверлей (PNG/WebP или зацикленное видео MP4/MOV/…)</span>
+          {props.mcPrewarmEnabled ? (
+            <span className="text-[10px] text-industrial-dim">
+              При «Майнкрафт прогрев» оверлей в эфир не подмешивается — только полноэкранные куски 1080×1920.
+            </span>
+          ) : null}
           <div className="flex gap-2">
             <input
               readOnly
@@ -632,6 +795,89 @@ function StreamerEditorForm(props: {
             </button>
           </div>
         </label>
+        <div className="flex flex-col gap-2 rounded border border-industrial-border/60 bg-industrial-bg/30 p-3 md:col-span-2">
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              type="checkbox"
+              checked={props.mcPrewarmEnabled}
+              onChange={(e) => props.setMcPrewarmEnabled(e.target.checked)}
+              className="h-3.5 w-3.5 shrink-0"
+            />
+            <span className="text-industrial-muted">Майнкрафт прогрев (тест)</span>
+          </label>
+          {props.mcPrewarmEnabled ? (
+            <div className="flex flex-col gap-3 pl-1">
+              <p className="text-[10px] leading-snug text-industrial-dim">
+                Видео — на весь кадр 1080×1920 (оверлей из настроек не используется). Куски должны быть уже в этом
+                размере; ffmpeg лишь подрежет/масштабирует к 1080×1920 при отклонении. Shuffle как в основном цикле;
+                SFX — только .mp3, пауза 0.5–1.5 с между клипами, fade in/out ~0.2 с (кэш в temp). Музыка — один .mp3
+                (concat + микс с SFX на ~10% громкости относительно SFX).
+              </p>
+              <label className="flex flex-col gap-1">
+                <span className="text-industrial-muted">Папка с кусками (прогрев)</span>
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={props.mcChunksDir}
+                    className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const p = await window.electronAPI.dialog.openDirectory()
+                      if (p) props.setMcChunksDir(p)
+                    }}
+                    className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
+                  >
+                    …
+                  </button>
+                </div>
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-industrial-muted">Папка с аудио (SFX, только .mp3)</span>
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={props.mcAudioDir}
+                    className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const p = await window.electronAPI.dialog.openDirectory()
+                      if (p) props.setMcAudioDir(p)
+                    }}
+                    className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
+                  >
+                    …
+                  </button>
+                </div>
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-industrial-muted">Музыка на стриме (.mp3)</span>
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={props.mcMusicPath}
+                    className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const p = await window.electronAPI.dialog.openFile({
+                        filters: [{ name: 'MP3', extensions: ['mp3'] }]
+                      })
+                      if (p) props.setMcMusicPath(p)
+                    }}
+                    className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
+                  >
+                    …
+                  </button>
+                </div>
+              </label>
+            </div>
+          ) : null}
+        </div>
         <label className="flex flex-col gap-1 md:col-span-2">
           <span className="text-industrial-muted">Доп. аргументы ffmpeg (вставляются перед -f flv)</span>
           <input
@@ -651,15 +897,14 @@ function StreamerEditorForm(props: {
           <label className="flex flex-col gap-1 md:col-span-2">
             <span className="text-industrial-muted">Broadcast ID</span>
             <p className="text-[10px] leading-snug text-industrial-dim">
-              Внутренний ID эфира YouTube (liveBroadcast), не путать со stream key. Нужен для опроса зрителей. Можно
-              не вводить вручную: кнопка «Подставить с YouTube» берёт актуальный эфир канала (live / тест / запланированный).
-              Иначе — из URL Studio при редактировании эфира или из Live Streaming API.
+              Подставляется с YouTube автоматически при каждом старте стрима и перед каждым новым циклом. Поле можно
+              править вручную или обновить кнопкой ниже.
             </p>
             <div className="flex flex-wrap gap-2">
               <input
                 value={props.broadcastId}
                 onChange={(e) => props.setBroadcastId(e.target.value)}
-                placeholder="например из URL или API"
+                placeholder="подставится автоматически"
                 className="min-w-[12rem] flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
               />
               {props.editId != null ? (
@@ -683,13 +928,13 @@ function StreamerEditorForm(props: {
                   }}
                   className="shrink-0 border border-industrial-border px-2 py-1.5 text-[11px] hover:bg-industrial-raised disabled:opacity-50"
                 >
-                  {suggestBusy ? '…' : 'Подставить с YouTube'}
+                  {suggestBusy ? '…' : 'Обновить с YouTube'}
                 </button>
               ) : null}
             </div>
           </label>
           <label className="flex flex-col gap-1 md:col-span-2">
-            <span className="text-industrial-muted">Заголовок</span>
+            <span className="text-industrial-muted">Название</span>
             <input
               value={props.bTitle}
               onChange={(e) => props.setBTitle(e.target.value)}
@@ -720,9 +965,9 @@ function StreamerEditorForm(props: {
               onChange={(e) => props.setBPrivacy(e.target.value as 'private' | 'public' | 'unlisted')}
               className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
             >
-              <option value="private">private</option>
-              <option value="unlisted">unlisted</option>
-              <option value="public">public</option>
+              <option value="private">Приватный (только вы)</option>
+              <option value="unlisted">По ссылке (не в поиске и подписках)</option>
+              <option value="public">Открытый (все могут найти)</option>
             </select>
           </label>
           <label className="flex flex-col gap-1">

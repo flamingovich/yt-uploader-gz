@@ -17,6 +17,12 @@ export function getProxyById(id: number): ProxyRow | undefined {
   return getDb().prepare(`SELECT * FROM proxies WHERE id = ?`).get(id) as ProxyRow | undefined
 }
 
+export function getProxyByHostPort(host: string, port: number): ProxyRow | undefined {
+  return getDb()
+    .prepare(`SELECT * FROM proxies WHERE host = ? AND port = ? LIMIT 1`)
+    .get(host.trim(), port) as ProxyRow | undefined
+}
+
 export function updateProxyCheckStatus(id: number, statusJson: string): void {
   getDb()
     .prepare(
@@ -56,16 +62,23 @@ export type ChannelListItem = Omit<
   last_uploaded_video_id: string | null
   /** Ближайшее будущее scheduled_publish_at в очереди (не failed/cancelled). */
   next_scheduled_publish_at: string | null
+  /**
+   * Макс. дата среди: последняя публикация (completed_at) и все запланированные слоты в очереди
+   * (scheduled_publish_at для не failed/cancelled) — чтобы учитывать «дальнюю» отложку.
+   */
+  last_queue_activity_at: string | null
+  /** Есть стример в starting/live на этом канале. */
+  has_live_stream: number
 }
 
 export function listChannels(): ChannelListItem[] {
   return getDb()
     .prepare(
-      `SELECT c.id, c.proxy_id, c.oauth_profile_id, c.youtube_channel_id, c.channel_title,
+      `SELECT c.id, c.proxy_id, c.oauth_profile_id, c.ads_profile_id, c.ads_profile_name, c.youtube_channel_id, c.channel_title,
               c.default_description, c.default_tags, c.made_for_kids, c.default_category_id, c.default_language, c.publish_mode,
               c.schedule_start_at, c.schedule_videos_per_day, c.schedule_window_start_hour,
               c.schedule_window_end_hour, c.schedule_randomize_minutes, c.schedule_timezone,
-              c.source_folder_path, c.is_enabled, c.created_at, c.updated_at, p.label AS oauth_profile_label,
+              c.source_folder_path, c.is_enabled, c.upload_cooldown_seconds, c.created_at, c.updated_at, p.label AS oauth_profile_label,
               (
                 SELECT q.completed_at
                 FROM upload_queue q
@@ -92,7 +105,30 @@ export function listChannels(): ChannelListItem[] {
                 ORDER BY unixepoch(trim(q.scheduled_publish_at)) ASC NULLS LAST,
                          trim(q.scheduled_publish_at) ASC
                 LIMIT 1
-              ) AS next_scheduled_publish_at
+              ) AS next_scheduled_publish_at,
+              (
+                SELECT MAX(dt)
+                FROM (
+                  SELECT trim(q.completed_at) AS dt
+                  FROM upload_queue q
+                  WHERE q.channel_id = c.id
+                    AND q.completed_at IS NOT NULL
+                    AND trim(COALESCE(q.completed_at, '')) != ''
+                  UNION ALL
+                  SELECT trim(q.scheduled_publish_at) AS dt
+                  FROM upload_queue q
+                  WHERE q.channel_id = c.id
+                    AND trim(COALESCE(q.scheduled_publish_at, '')) != ''
+                    AND q.status NOT IN ('failed', 'cancelled')
+                ) u
+                WHERE u.dt IS NOT NULL AND length(trim(u.dt)) > 0
+              ) AS last_queue_activity_at,
+              (
+                SELECT CASE WHEN EXISTS (
+                  SELECT 1 FROM streamers s
+                  WHERE s.channel_id = c.id AND s.process_status IN ('starting', 'live')
+                ) THEN 1 ELSE 0 END
+              ) AS has_live_stream
        FROM channels c
        LEFT JOIN oauth_profiles p ON p.id = c.oauth_profile_id
        ORDER BY c.id ASC`
@@ -102,6 +138,8 @@ export function listChannels(): ChannelListItem[] {
 
 export function updateChannelPublishingSettings(input: {
   channel_id: number
+  ads_profile_id: string | null
+  ads_profile_name: string | null
   default_description: string | null
   default_tags: string | null
   made_for_kids: number
@@ -115,6 +153,7 @@ export function updateChannelPublishingSettings(input: {
   schedule_randomize_minutes: number
   schedule_timezone: string
   source_folder_path: string | null
+  upload_cooldown_seconds: number
 }): void {
   getDb()
     .prepare(
@@ -132,6 +171,9 @@ export function updateChannelPublishingSettings(input: {
            schedule_randomize_minutes = @schedule_randomize_minutes,
            schedule_timezone = @schedule_timezone,
            source_folder_path = @source_folder_path,
+           upload_cooldown_seconds = @upload_cooldown_seconds,
+           ads_profile_id = @ads_profile_id,
+           ads_profile_name = @ads_profile_name,
            updated_at = datetime('now')
        WHERE id = @channel_id`
     )
@@ -149,24 +191,43 @@ export function updateChannelPublishingSettings(input: {
       schedule_window_end_hour: input.schedule_window_end_hour,
       schedule_randomize_minutes: input.schedule_randomize_minutes,
       schedule_timezone: input.schedule_timezone.trim() || 'Europe/Moscow',
-      source_folder_path: input.source_folder_path?.trim() || null
+      source_folder_path: input.source_folder_path?.trim() || null,
+      upload_cooldown_seconds: input.upload_cooldown_seconds,
+      ads_profile_id: input.ads_profile_id?.trim() || null,
+      ads_profile_name: input.ads_profile_name?.trim() || null
+    })
+}
+
+export function updateChannelAdsProfileName(channelId: number, name: string | null): void {
+  getDb()
+    .prepare(
+      `UPDATE channels
+       SET ads_profile_name = @name,
+           updated_at = datetime('now')
+       WHERE id = @channel_id`
+    )
+    .run({
+      channel_id: channelId,
+      name: name?.trim() || null
     })
 }
 
 export function insertChannel(input: {
   proxy_id?: number | null
   oauth_profile_id?: number | null
+  ads_profile_id?: string | null
   channel_title: string
   source_folder_path?: string | null
 }): { id: number } {
   const r = getDb()
     .prepare(
-      `INSERT INTO channels (proxy_id, oauth_profile_id, channel_title, source_folder_path, updated_at)
-       VALUES (@proxy_id, @oauth_profile_id, @channel_title, @source_folder_path, datetime('now'))`
+      `INSERT INTO channels (proxy_id, oauth_profile_id, ads_profile_id, channel_title, source_folder_path, updated_at)
+       VALUES (@proxy_id, @oauth_profile_id, @ads_profile_id, @channel_title, @source_folder_path, datetime('now'))`
     )
     .run({
       proxy_id: input.proxy_id ?? null,
       oauth_profile_id: input.oauth_profile_id ?? null,
+      ads_profile_id: input.ads_profile_id?.trim() || null,
       channel_title: input.channel_title.trim(),
       source_folder_path: input.source_folder_path?.trim() || null
     })
@@ -179,6 +240,20 @@ export function deleteChannel(id: number): void {
 
 export function getChannelById(id: number): ChannelRow | undefined {
   return getDb().prepare(`SELECT * FROM channels WHERE id = ?`).get(id) as ChannelRow | undefined
+}
+
+export function updateChannelProxyBinding(channelId: number, proxyId: number | null): void {
+  getDb()
+    .prepare(
+      `UPDATE channels
+       SET proxy_id = @proxy_id,
+           updated_at = datetime('now')
+       WHERE id = @channel_id`
+    )
+    .run({
+      channel_id: channelId,
+      proxy_id: proxyId
+    })
 }
 
 export function updateChannelOAuthData(input: {

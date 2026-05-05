@@ -185,3 +185,51 @@ CREATE TABLE streamers (
 CREATE INDEX IF NOT EXISTS idx_streamers_channel ON streamers (channel_id);
 `)
 }
+
+/** Миграция v7: длительность заглушки перед циклом (секунды / авто). */
+export function migrateToV7IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'bumper_pad_target_sec')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN bumper_pad_target_sec INTEGER`)
+  }
+}
+
+/** Миграция v8: пауза между загрузками на уровне канала. */
+export function migrateToV8IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'upload_cooldown_seconds')) {
+    db.exec(
+      `ALTER TABLE channels ADD COLUMN upload_cooldown_seconds INTEGER NOT NULL DEFAULT 20`
+    )
+  }
+}
+
+/** Миграция v9: режим «Майнкрафт прогрев» (отдельные куски / SFX / музыка). */
+export function migrateToV9IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  const add = (name: string, ddl: string): void => {
+    if (!cols.some((c) => c.name === name)) {
+      db.exec(ddl)
+    }
+  }
+  add('minecraft_prewarm_enabled', `ALTER TABLE streamers ADD COLUMN minecraft_prewarm_enabled INTEGER NOT NULL DEFAULT 0`)
+  add('minecraft_prewarm_chunks_folder', `ALTER TABLE streamers ADD COLUMN minecraft_prewarm_chunks_folder TEXT`)
+  add('minecraft_prewarm_audio_folder', `ALTER TABLE streamers ADD COLUMN minecraft_prewarm_audio_folder TEXT`)
+  add('minecraft_prewarm_music_path', `ALTER TABLE streamers ADD COLUMN minecraft_prewarm_music_path TEXT`)
+}
+
+/** Миграция v10: ADS profile id на уровне канала. */
+export function migrateToV10IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'ads_profile_id')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN ads_profile_id TEXT`)
+  }
+}
+
+/** Миграция v11: отображаемое имя ADS-профиля (из Local API). */
+export function migrateToV11IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'ads_profile_name')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN ads_profile_name TEXT`)
+  }
+}

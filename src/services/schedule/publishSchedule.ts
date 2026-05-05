@@ -62,6 +62,7 @@ export function collectFuturePublishCandidates(input: {
   seedDay.setHours(0, 0, 0, 0)
 
   const out: Date[] = []
+  const seen = new Set<number>()
   let serial = 0
   for (let dayShift = 0; dayShift < 90 && out.length < input.needCount; dayShift += 1) {
     for (let inDay = 0; inDay < perDay && out.length < input.needCount; inDay += 1) {
@@ -69,8 +70,12 @@ export function collectFuturePublishCandidates(input: {
       t.setDate(t.getDate() + dayShift)
       if (hasAnchor && dayShift === 0) {
         const anchorM = anchor!.getHours() * 60 + anchor!.getMinutes()
+        const candidateMinutes = anchorM + inDay * slotMinutes
+        // Не допускаем "перелив" слотов первого дня на следующий календарный день:
+        // именно он порождал лишние слоты/дубли типа 09:00, 09:00, 09:12.
+        if (candidateMinutes > endH * 60 + 59) break
         t.setHours(0, 0, 0, 0)
-        t.setMinutes(anchorM + inDay * slotMinutes)
+        t.setMinutes(candidateMinutes)
       } else {
         t.setHours(startH, 0, 0, 0)
         t.setMinutes(inDay * slotMinutes)
@@ -80,7 +85,11 @@ export function collectFuturePublishCandidates(input: {
       }
       serial += 1
       const clamped = clampDateToPublicationWindow(t, startH, endH)
-      if (clamped >= input.minFuture) out.push(clamped)
+      const ts = clamped.getTime()
+      if (clamped >= input.minFuture && !seen.has(ts)) {
+        seen.add(ts)
+        out.push(clamped)
+      }
     }
   }
   return out

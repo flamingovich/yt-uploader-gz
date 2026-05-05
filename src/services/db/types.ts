@@ -38,6 +38,9 @@ export interface ChannelRow {
   id: number
   proxy_id: number | null
   oauth_profile_id: number | null
+  ads_profile_id: string | null
+  /** Имя профиля в ADS Power (из Local API), для отображения. */
+  ads_profile_name: string | null
   youtube_channel_id: string | null
   channel_title: string | null
   default_description: string | null
@@ -57,6 +60,8 @@ export interface ChannelRow {
   token_expires_at: string | null
   source_folder_path: string | null
   is_enabled: number
+  /** Пауза между загрузками видео с этого канала (сек). */
+  upload_cooldown_seconds: number
   created_at: string
   updated_at: string
 }
@@ -105,6 +110,8 @@ export interface StreamerRow {
   overlay_path: string | null
   segments_folder_path: string | null
   bumper_video_path: string | null
+  /** NULL = авто; 0 = один проигрыв; >0 = зациклить до N сек. */
+  bumper_pad_target_sec: number | null
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null
@@ -118,6 +125,10 @@ export interface StreamerRow {
   process_status: string
   process_error_message: string | null
   cycle_state_json: string | null
+  minecraft_prewarm_enabled: number
+  minecraft_prewarm_chunks_folder: string | null
+  minecraft_prewarm_audio_folder: string | null
+  minecraft_prewarm_music_path: string | null
   created_at: string
   updated_at: string
 }

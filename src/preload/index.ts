@@ -2,6 +2,11 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 const api = {
   bootstrap: (): Promise<{ ok: true }> => ipcRenderer.invoke('app:bootstrap'),
+  onDataChanged: (cb: (payload: { actionType: string; at: number }) => void): (() => void) => {
+    const handler = (_event: unknown, payload: { actionType: string; at: number }) => cb(payload)
+    ipcRenderer.on('app:dataChanged', handler)
+    return () => ipcRenderer.off('app:dataChanged', handler)
+  },
   openExternalUrl: (url: string) =>
     ipcRenderer.invoke('app:openExternalUrl', { url }) as Promise<{ ok: true } | { ok: false; error: string }>,
   dialog: {
@@ -43,6 +48,7 @@ const api = {
     createChannel: (payload: {
       proxy_id?: number | null
       oauth_profile_id?: number | null
+      ads_profile_id?: string | null
       channel_title: string
       source_folder_path?: string | null
     }) => ipcRenderer.invoke('db:channels:create', payload),
@@ -62,9 +68,15 @@ const api = {
       schedule_randomize_minutes?: number
       schedule_timezone?: string
       source_folder_path?: string | null
+      upload_cooldown_seconds?: number
+      ads_profile_id?: string | null
     }) => ipcRenderer.invoke('db:channels:updatePublishing', payload),
     connectYouTube: (payload: { channelId: number }) => ipcRenderer.invoke('channels:connectYouTube', payload),
     oauthBeginManual: (payload: { channelId: number }) => ipcRenderer.invoke('channels:oauthBeginManual', payload),
+    oauthBeginManualInAds: (payload: { channelId: number }) =>
+      ipcRenderer.invoke('channels:oauthBeginManualInAds', payload),
+    syncProxyFromAds: (payload: { channelId: number }) => ipcRenderer.invoke('channels:syncProxyFromAds', payload),
+    oauthWaitManual: (payload: { flowId: string; timeoutMs?: number }) => ipcRenderer.invoke('channels:oauthWaitManual', payload),
     oauthFinishManual: (payload: { flowId: string; callbackUrl: string }) =>
       ipcRenderer.invoke('channels:oauthFinishManual', payload),
     uploadTestVideo: (payload: { channelId: number }) => ipcRenderer.invoke('channels:uploadTestVideo', payload),
@@ -82,6 +94,7 @@ const api = {
       overlay_path?: string | null
       segments_folder_path?: string | null
       bumper_video_path?: string | null
+      bumper_pad_target_sec?: number | null
       ffmpeg_extra_args?: string | null
       youtube_broadcast_id?: string | null
       broadcast_title?: string | null
@@ -90,6 +103,10 @@ const api = {
       broadcast_privacy?: string
       broadcast_category_id?: string
       broadcast_thumb_path?: string | null
+      minecraft_prewarm_enabled?: number | boolean
+      minecraft_prewarm_chunks_folder?: string | null
+      minecraft_prewarm_audio_folder?: string | null
+      minecraft_prewarm_music_path?: string | null
     }) => ipcRenderer.invoke('db:streamers:update', payload),
     deleteStreamer: (id: number) => ipcRenderer.invoke('db:streamers:delete', id)
   },
@@ -108,6 +125,16 @@ const api = {
     }) => ipcRenderer.invoke('streamers:applyBroadcastMeta', payload),
     suggestBroadcastId: (payload: { streamerId: number }) =>
       ipcRenderer.invoke('streamers:suggestBroadcastId', payload)
+  },
+  ai: {
+    generateChannelMeta: (payload: {
+      channelId?: number
+      kind: 'description' | 'tags'
+      topicPrompt: string
+      language?: string
+      category?: string
+      madeForKids?: boolean
+    }) => ipcRenderer.invoke('ai:generateChannelMeta', payload)
   }
 } as const
 

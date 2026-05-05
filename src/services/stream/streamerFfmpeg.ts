@@ -266,6 +266,78 @@ export function buildFfmpegBumperDirectArgs(input: {
   return base
 }
 
+/**
+ * Майнкрафт-прогрев: куски уже вертикальные 1080×1920 — без оверлея и без «окна» на подложке;
+ * только выравнивание к Shorts-кадру + микс SFX и музыки.
+ */
+export function buildFfmpegStreamArgsMinecraftPrewarm(input: {
+  concatListPath: string
+  sfxConcatListPath: string
+  musicConcatListPath: string
+  outputRtmpUrl: string
+  extraArgs: string | null
+}): string[] {
+  const concatVideo = input.concatListPath.trim().replace(/\\/g, '/')
+  const concatSfx = input.sfxConcatListPath.trim().replace(/\\/g, '/')
+  const concatMusic = input.musicConcatListPath.trim().replace(/\\/g, '/')
+
+  const videoFullVertical = `[0:v]scale=${CANVAS_W}:${CANVAS_H}:force_original_aspect_ratio=increase,crop=${CANVAS_W}:${CANVAS_H}:(iw-ow)/2:(ih-oh)/2,setsar=1,format=yuv420p[outv]`
+  /** Музыка (вход 2) — ~10% громкости относительно SFX при миксе. */
+  const amixBlock =
+    `[1:a]aresample=44100[sfxa];[2:a]aresample=44100,volume=0.1[musa];[sfxa][musa]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[aud]`
+  const filterComplex = `${videoFullVertical};${amixBlock}`
+  const maps = ['-map', '[outv]', '-map', '[aud]']
+
+  const base: string[] = ['-hide_banner', '-loglevel', 'warning', '-stats_period', '1']
+  base.push('-re', '-f', 'concat', '-safe', '0', '-i', concatVideo)
+  base.push('-re', '-f', 'concat', '-safe', '0', '-i', concatSfx)
+  base.push('-re', '-f', 'concat', '-safe', '0', '-i', concatMusic)
+  base.push(
+    '-filter_complex',
+    filterComplex,
+    ...maps,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-g',
+    '60',
+    '-keyint_min',
+    '60',
+    '-b:v',
+    '6000k',
+    '-minrate',
+    '6000k',
+    '-maxrate',
+    '6000k',
+    '-bufsize',
+    '12000k',
+    '-x264-params',
+    'nal-hrd=cbr:force-cfr=1',
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-ar',
+    '44100',
+    '-f',
+    'flv',
+    input.outputRtmpUrl
+  )
+
+  const extra = (input.extraArgs ?? '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+  if (extra.length) {
+    const flvIdx = base.lastIndexOf('-f')
+    if (flvIdx !== -1) base.splice(flvIdx, 0, ...extra)
+  }
+  return base
+}
+
 export function spawnFfmpeg(args: string[]): ChildProcess {
   return spawn('ffmpeg', args, {
     stdio: ['ignore', 'ignore', 'pipe'],

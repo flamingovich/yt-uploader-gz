@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS channels (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   proxy_id INTEGER REFERENCES proxies (id) ON DELETE SET NULL,
   oauth_profile_id INTEGER REFERENCES oauth_profiles (id) ON DELETE SET NULL,
+  ads_profile_id TEXT,
+  ads_profile_name TEXT,
   youtube_channel_id TEXT UNIQUE,
   channel_title TEXT,
   default_description TEXT,
@@ -69,6 +71,7 @@ CREATE TABLE IF NOT EXISTS channels (
   token_expires_at TEXT,
   source_folder_path TEXT,
   is_enabled INTEGER NOT NULL DEFAULT 1 CHECK (is_enabled IN (0, 1)),
+  upload_cooldown_seconds INTEGER NOT NULL DEFAULT 20,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -133,6 +136,8 @@ CREATE TABLE IF NOT EXISTS streamers (
   overlay_path TEXT,
   segments_folder_path TEXT,
   bumper_video_path TEXT,
+  /** NULL = авто (до 3 мин если ролик короче); 0 = один проигрыв; >0 = зациклить до N сек. */
+  bumper_pad_target_sec INTEGER,
   ffmpeg_extra_args TEXT,
   youtube_broadcast_id TEXT,
   broadcast_title TEXT,
@@ -148,6 +153,10 @@ CREATE TABLE IF NOT EXISTS streamers (
   ),
   process_error_message TEXT,
   cycle_state_json TEXT,
+  minecraft_prewarm_enabled INTEGER NOT NULL DEFAULT 0 CHECK (minecraft_prewarm_enabled IN (0, 1)),
+  minecraft_prewarm_chunks_folder TEXT,
+  minecraft_prewarm_audio_folder TEXT,
+  minecraft_prewarm_music_path TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

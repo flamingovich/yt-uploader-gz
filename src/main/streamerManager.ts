@@ -7,27 +7,40 @@ import { join, resolve } from 'node:path'
 import { getChannelById, getProxyById } from '@services/db/queries'
 import {
   getStreamerById,
+  updateStreamer,
   updateStreamerProcessState,
   updateStreamerViewers
 } from '@services/db/streamersQueries'
 import { getOAuthClientCredentialsForChannel } from '@services/google/oauthForChannel'
 import { startSocksTcpRelay } from '@services/stream/tcpRelaySocks'
 import {
+  collectMinecraftPrewarmAudioMp3,
   collectSegmentVideos,
+  streamerMultiPassCount,
   unlinkQuiet,
-  writeConcatListFileMultiShuffledPasses
+  writeConcatListFileMultiShuffledPasses,
+  writeMinecraftSfxConcatListMultiPasses,
+  writeMusicRepeatConcatList
 } from '@services/stream/streamerConcat'
 import { getMediaDurationSeconds } from '@services/stream/ffprobe'
 import {
   buildFfmpegBumperDirectArgs,
   buildFfmpegStreamArgs,
+  buildFfmpegStreamArgsMinecraftPrewarm,
   combineRtmpUrl,
   parseRtmpDestination,
   rewriteRtmpUrlForLocalTunnel,
   spawnFfmpeg
 } from '@services/stream/streamerFfmpeg'
-import { fetchLiveBroadcastConcurrentViewers } from '@services/youtube/liveBroadcast'
+import {
+  fetchLiveBroadcastConcurrentViewers,
+  suggestLiveBroadcastId
+} from '@services/youtube/liveBroadcast'
 import type { ProxyRow, StreamerRow } from '@services/db/types'
+
+function isMinecraftPrewarmOn(row: StreamerRow): boolean {
+  return Number(row.minecraft_prewarm_enabled) === 1
+}
 
 type CreateOk = { ok: true }
 type CreateErr = { ok: false; error: string }
@@ -171,6 +184,53 @@ async function killProcessTree(pid: number | undefined): Promise<void> {
   })
 }
 
+function restartViewerPolling(
+  session: Session,
+  streamerId: number,
+  broadcastId: string | null,
+  channelId: number
+): void {
+  if (session.viewerTimer) {
+    clearInterval(session.viewerTimer)
+    session.viewerTimer = null
+  }
+  const b = broadcastId?.trim()
+  if (b) {
+    session.viewerTimer = startViewerPolling(streamerId, b, channelId)
+  }
+}
+
+/** Подставить актуальный Broadcast ID с YouTube и обновить опрос зрителей. */
+async function syncYoutubeBroadcastId(streamerId: number, session: Session | null): Promise<void> {
+  const row = getStreamerById(streamerId)
+  if (!row?.channel_id) return
+  const ch = getChannelById(row.channel_id)
+  if (!ch?.oauth_refresh_token?.trim()) return
+  let effectiveId: string | null = row.youtube_broadcast_id?.trim() || null
+  try {
+    const creds = getOAuthClientCredentialsForChannel(row.channel_id)
+    const hit = await suggestLiveBroadcastId({
+      clientId: creds.clientId,
+      clientSecret: creds.clientSecret,
+      refreshToken: creds.channel.oauth_refresh_token!,
+      accessToken: creds.channel.oauth_access_token,
+      proxy: creds.proxy ?? null
+    })
+    if (hit?.broadcastId) {
+      const prev = (row.youtube_broadcast_id ?? '').trim()
+      if (prev !== hit.broadcastId) {
+        updateStreamer(streamerId, { youtube_broadcast_id: hit.broadcastId })
+      }
+      effectiveId = hit.broadcastId
+    }
+  } catch {
+    /* не блокируем эфир */
+  }
+  if (session) {
+    restartViewerPolling(session, streamerId, effectiveId, row.channel_id)
+  }
+}
+
 function startViewerPolling(streamerId: number, broadcastId: string, channelId: number): ReturnType<typeof setInterval> {
   const tick = (): void => {
     void (async () => {
@@ -233,8 +293,18 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
   if (first.bumper_video_path?.trim()) {
     try {
       const bumperFs = resolve(first.bumper_video_path.trim())
+      const padCfg = first.bumper_pad_target_sec
       const durSec = await getMediaDurationSeconds(bumperFs)
-      const padShort = durSec != null && durSec > 0 && durSec < 180 ? 180 : undefined
+      let padShort: number | undefined
+      if (padCfg != null && Number.isFinite(padCfg)) {
+        if (padCfg <= 0) {
+          padShort = undefined
+        } else {
+          padShort = padCfg
+        }
+      } else {
+        padShort = durSec != null && durSec > 0 && durSec < 180 ? 180 : undefined
+      }
       const bumperArgs = buildFfmpegBumperDirectArgs({
         inputFile: bumperFs,
         outputRtmpUrl,
@@ -255,11 +325,17 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
   }
 
   while (!session.stopRequested) {
+    await syncYoutubeBroadcastId(streamerId, session)
     const row = getStreamerById(streamerId)
     if (!row) break
-    const dir = row.segments_folder_path?.trim()
+    const mc = isMinecraftPrewarmOn(row)
+    const dir = mc ? row.minecraft_prewarm_chunks_folder?.trim() : row.segments_folder_path?.trim()
     if (!dir) {
-      updateStreamerProcessState(streamerId, 'error', 'Не указана папка с кусками')
+      updateStreamerProcessState(
+        streamerId,
+        'error',
+        mc ? 'Не указана папка с кусками (Майнкрафт прогрев)' : 'Не указана папка с кусками'
+      )
       return
     }
     const segs = await collectSegmentVideos(dir)
@@ -268,6 +344,8 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
       return
     }
     let listPath: string | null = null
+    let sfxListPath: string | null = null
+    let musicListPath: string | null = null
     try {
       listPath = await writeConcatListFileMultiShuffledPasses({
         segmentPaths: segs
@@ -281,16 +359,72 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
       return
     }
 
-    const args = buildFfmpegStreamArgs({
-      concatListPath: listPath!,
-      outputRtmpUrl: outputRtmpUrl,
-      overlayPath: row.overlay_path,
-      extraArgs: row.ffmpeg_extra_args
-    })
+    let args: string[]
+    if (mc) {
+      const audioDir = row.minecraft_prewarm_audio_folder?.trim()
+      const musicFs = row.minecraft_prewarm_music_path?.trim()
+      if (!audioDir || !musicFs) {
+        await unlinkQuiet(listPath!)
+        updateStreamerProcessState(streamerId, 'error', 'Майнкрафт прогрев: укажите папку SFX и музыку .mp3')
+        return
+      }
+      let sfxFiles: string[] = []
+      try {
+        sfxFiles = await collectMinecraftPrewarmAudioMp3(audioDir)
+      } catch (e) {
+        await unlinkQuiet(listPath!)
+        updateStreamerProcessState(
+          streamerId,
+          'error',
+          e instanceof Error ? e.message : 'Папка SFX недоступна'
+        )
+        return
+      }
+      if (sfxFiles.length === 0) {
+        await unlinkQuiet(listPath!)
+        updateStreamerProcessState(streamerId, 'error', 'В папке SFX нет .mp3')
+        return
+      }
+      try {
+        sfxListPath = await writeMinecraftSfxConcatListMultiPasses({ audioPaths: sfxFiles })
+        const passes = streamerMultiPassCount(segs.length)
+        const estVideoSec = Math.max(7200, Math.min(7 * 86400, segs.length * passes * 8))
+        musicListPath = await writeMusicRepeatConcatList({
+          musicPath: musicFs,
+          targetMinDurationSec: estVideoSec
+        })
+      } catch (e) {
+        await unlinkQuiet(listPath!)
+        await unlinkQuiet(sfxListPath ?? '')
+        await unlinkQuiet(musicListPath ?? '')
+        updateStreamerProcessState(
+          streamerId,
+          'error',
+          e instanceof Error ? e.message : 'Ошибка списков SFX/музыки'
+        )
+        return
+      }
+      args = buildFfmpegStreamArgsMinecraftPrewarm({
+        concatListPath: listPath!,
+        sfxConcatListPath: sfxListPath!,
+        musicConcatListPath: musicListPath!,
+        outputRtmpUrl,
+        extraArgs: row.ffmpeg_extra_args
+      })
+    } else {
+      args = buildFfmpegStreamArgs({
+        concatListPath: listPath!,
+        outputRtmpUrl: outputRtmpUrl,
+        overlayPath: row.overlay_path,
+        extraArgs: row.ffmpeg_extra_args
+      })
+    }
 
     updateStreamerProcessState(streamerId, 'live', null)
     const { code, stderr } = await runFfmpegWithCapturedStderr(args, session)
     await unlinkQuiet(listPath!)
+    await unlinkQuiet(sfxListPath ?? '')
+    await unlinkQuiet(musicListPath ?? '')
 
     if (session.stopRequested) break
 
@@ -330,10 +464,27 @@ export async function startStreamer(streamerId: number): Promise<CreateResult> {
   if (!ch?.oauth_refresh_token) {
     return { ok: false, error: 'У канала нет OAuth refresh token — подключите YouTube в разделе «Каналы»' }
   }
-  const dir = row.segments_folder_path?.trim()
-  if (!dir) return { ok: false, error: 'Укажите папку с видео-кусками' }
+  const mc = isMinecraftPrewarmOn(row)
+  const dir = mc ? row.minecraft_prewarm_chunks_folder?.trim() : row.segments_folder_path?.trim()
+  if (!dir) {
+    return {
+      ok: false,
+      error: mc ? 'Укажите папку с кусками для «Майнкрафт прогрев»' : 'Укажите папку с видео-кусками'
+    }
+  }
   const segs = await collectSegmentVideos(dir)
   if (segs.length === 0) return { ok: false, error: 'В папке кусков нет видеофайлов' }
+  if (mc) {
+    const ad = row.minecraft_prewarm_audio_folder?.trim()
+    const mus = row.minecraft_prewarm_music_path?.trim()
+    if (!ad) return { ok: false, error: 'Майнкрафт прогрев: укажите папку с аудио (.mp3)' }
+    if (!mus) return { ok: false, error: 'Майнкрафт прогрев: укажите файл музыки (.mp3)' }
+    if (!mus.toLowerCase().endsWith('.mp3')) {
+      return { ok: false, error: 'Музыка на стриме должна быть в формате .mp3' }
+    }
+    const sfx = await collectMinecraftPrewarmAudioMp3(ad)
+    if (sfx.length === 0) return { ok: false, error: 'В папке SFX нет .mp3 файлов' }
+  }
   if (!hasSocksProxyConfigured(row)) {
     return {
       ok: false,
@@ -354,10 +505,7 @@ export async function startStreamer(streamerId: number): Promise<CreateResult> {
   }
   sessions.set(streamerId, session)
 
-  const bid = row.youtube_broadcast_id?.trim()
-  if (bid) {
-    session.viewerTimer = startViewerPolling(streamerId, bid, row.channel_id)
-  }
+  await syncYoutubeBroadcastId(streamerId, session)
 
   void (async () => {
     try {

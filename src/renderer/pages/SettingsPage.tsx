@@ -1,26 +1,55 @@
+import { Check, Copy } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-
-const LINK = (href: string, label: string) => (
-  <a
-    href={href}
-    target="_blank"
-    rel="noreferrer"
-    className="text-industrial-text underline decoration-industrial-border underline-offset-2 hover:decoration-industrial-text"
-  >
-    {label}
-  </a>
-)
 
 type OAuthListItem = Awaited<ReturnType<typeof window.electronAPI.db.listOAuthProfiles>>[number]
 type CreateOAuthResult = Awaited<ReturnType<typeof window.electronAPI.db.createOAuthProfile>>
 type DeleteOAuthResult = Awaited<ReturnType<typeof window.electronAPI.db.deleteOAuthProfile>>
 
+function CopyableUrl({ href }: { href: string }): JSX.Element {
+  const [copied, setCopied] = useState(false)
+  async function onCopy(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(href)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1600)
+    } catch {
+      /* ignore */
+    }
+  }
+  return (
+    <span className="inline-flex max-w-full items-start gap-1.5 align-top">
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        className="min-w-0 break-all font-mono text-[11px] text-industrial-text underline decoration-industrial-border underline-offset-2 hover:decoration-industrial-text"
+      >
+        {href}
+      </a>
+      <button
+        type="button"
+        onClick={() => void onCopy()}
+        title={copied ? 'Скопировано' : 'Скопировать ссылку'}
+        className="mt-0.5 shrink-0 rounded border border-industrial-border bg-industrial-bg p-1 text-industrial-muted hover:border-industrial-muted hover:text-industrial-text"
+      >
+        {copied ? (
+          <Check className="h-3.5 w-3.5 text-emerald-400" strokeWidth={2} aria-hidden />
+        ) : (
+          <Copy className="h-3.5 w-3.5" strokeWidth={2} aria-hidden />
+        )}
+      </button>
+    </span>
+  )
+}
+
 export function SettingsPage(): JSX.Element {
   const [telegram_bot_token, setTelegramBotToken] = useState('')
   const [telegram_chat_id, setTelegramChatId] = useState('')
-  const [google_oauth_client_id, setGoogleClientId] = useState('')
-  const [google_oauth_client_secret, setGoogleClientSecret] = useState('')
-  const [upload_cooldown_seconds, setUploadCooldownSeconds] = useState('20')
+  const [adspower_api_base_url, setAdsPowerApiBaseUrl] = useState('http://local.adspower.net:50325')
+  const [adspower_api_key, setAdsPowerApiKey] = useState('')
+  const [g4f_api_base_url, setG4fApiBaseUrl] = useState('http://127.0.0.1:1337/v1')
+  const [g4f_model, setG4fModel] = useState('gpt-4o-mini')
+  const [g4f_api_key, setG4fApiKey] = useState('')
   const [oauthRows, setOauthRows] = useState<OAuthListItem[]>([])
   const [oauthLabel, setOauthLabel] = useState('')
   const [oauthCid, setOauthCid] = useState('')
@@ -35,9 +64,11 @@ export function SettingsPage(): JSX.Element {
       const [s, o] = await Promise.all([window.electronAPI.settings.get(), window.electronAPI.db.listOAuthProfiles()])
       setTelegramBotToken(s.telegram_bot_token ?? '')
       setTelegramChatId(s.telegram_chat_id ?? '')
-      setGoogleClientId(s.google_oauth_client_id ?? '')
-      setGoogleClientSecret(s.google_oauth_client_secret ?? '')
-      setUploadCooldownSeconds(s.upload_cooldown_seconds ?? '20')
+      setAdsPowerApiBaseUrl(s.adspower_api_base_url?.trim() || 'http://local.adspower.net:50325')
+      setAdsPowerApiKey(s.adspower_api_key ?? '')
+      setG4fApiBaseUrl(s.g4f_api_base_url?.trim() || 'http://127.0.0.1:1337/v1')
+      setG4fModel(s.g4f_model?.trim() || 'gpt-4o-mini')
+      setG4fApiKey(s.g4f_api_key ?? '')
       setOauthRows(o)
     } finally {
       setLoading(false)
@@ -48,23 +79,18 @@ export function SettingsPage(): JSX.Element {
     void load()
   }, [load])
 
-  async function onSaveTelegramAndCooldown(): Promise<void> {
+  async function onSaveTelegram(): Promise<void> {
     setStatus(null)
     await window.electronAPI.settings.set({
       telegram_bot_token,
       telegram_chat_id,
-      upload_cooldown_seconds
+      adspower_api_base_url,
+      adspower_api_key,
+      g4f_api_base_url,
+      g4f_model,
+      g4f_api_key
     })
-    setStatus('Telegram и пауза между загрузками сохранены.')
-  }
-
-  async function onSaveLegacyOAuth(): Promise<void> {
-    setStatus(null)
-    await window.electronAPI.settings.set({
-      google_oauth_client_id,
-      google_oauth_client_secret
-    })
-    setStatus('Legacy OAuth сохранен. Пустые значения не перезаписывают существующие ключи.')
+    setStatus('Настройки сохранены.')
   }
 
   async function onAddOAuthProfile(e: React.FormEvent): Promise<void> {
@@ -98,29 +124,10 @@ export function SettingsPage(): JSX.Element {
   return (
     <div className="flex flex-col gap-4">
       <div className="border border-industrial-border bg-industrial-panel p-4">
-        <div className="text-sm font-medium text-industrial-text">Что нужно заполнить</div>
-        <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-industrial-muted">
-          <li>
-            <span className="text-industrial-text">Telegram</span> — токен бота и chat_id для логов и статусов.
-          </li>
-          <li>
-            <span className="text-industrial-text">OAuth-профили</span> — по одному на каждый Google Cloud-проект
-            (Desktop OAuth client). На один профиль в этом приложении можно повесить до{' '}
-            <span className="text-industrial-text">10 каналов</span> (изоляция риска по API-проекту). Для 50 каналов —
-            например 5 профилей.
-          </li>
-          <li>
-            <span className="text-industrial-text">Устаревший вариант</span> — один Client ID/Secret в блоке ниже
-            (app_settings); для новых схем используйте таблицу профилей.
-          </li>
-        </ul>
-      </div>
-
-      <div className="border border-industrial-border bg-industrial-panel p-4">
-        <div className="text-sm font-medium text-industrial-text">OAuth-профили (рекомендуется)</div>
+        <div className="text-sm font-medium text-industrial-text">OAuth-Профили</div>
         <p className="mt-1 text-xs text-industrial-dim">
-          Каждая строка — отдельная пара Client ID / Secret из своего Cloud-проекта. Client Secret хранится в SQLite
-          только локально.
+          Каждая строка в таблице — отдельная пара Client ID / Client Secret из своего проекта Google Cloud. Секрет
+          хранится только локально в SQLite. На один профиль можно повесить до 10 каналов в этом приложении.
         </p>
 
         <div className="mt-4 overflow-auto border border-industrial-border bg-industrial-bg">
@@ -208,14 +215,163 @@ export function SettingsPage(): JSX.Element {
       </div>
 
       <div className="border border-industrial-border bg-industrial-panel p-4">
-        <div className="text-sm font-medium text-industrial-text">Telegram и устаревший единый OAuth</div>
+        <div className="text-sm font-medium text-industrial-text">Google Cloud — настройка OAuth</div>
         <p className="mt-1 text-xs text-industrial-dim">
-          Поля Google ниже — для обратной совместимости. Новые интеграции лучше вешать на OAuth-профили из блока выше.
+          Один такой проход на каждый OAuth-профиль в таблице выше. Потом в приложении привязывайте каналы к этому
+          профилю и добавляйте тестовых пользователей (п. 9) под каждую почту канала.
         </p>
+
+        <ol className="mt-4 list-decimal space-y-4 pl-5 text-xs text-industrial-muted">
+          <li className="pl-1">
+            <span className="text-industrial-text">Консоль.</span> Откройте Google Cloud Console (при запросе можно
+            выбрать любую страну/регион).
+            <div className="mt-1">
+              <CopyableUrl href="https://console.cloud.google.com/" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Новый проект.</span> Сверху слева «Select a project» → «New
+            Project», укажите любое имя и создайте проект.
+            <div className="mt-1">
+              <CopyableUrl href="https://console.cloud.google.com/projectcreate" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Экран согласия (OAuth consent).</span> Перейдите по ссылке →
+            «Get started».
+            <ul className="mt-2 list-disc space-y-1 pl-4">
+              <li>
+                Шаг 1: любое имя приложения.
+              </li>
+              <li>
+                Шаг 2: тип <span className="text-industrial-text">External</span>.
+              </li>
+              <li>
+                Шаг 3: укажите email той учётной записи Google, с которой создаёте проект (контакт разработчика).
+              </li>
+              <li>
+                Далее <span className="text-industrial-text">Finish</span> и при необходимости{' '}
+                <span className="text-industrial-text">Create</span>.
+              </li>
+            </ul>
+            <div className="mt-2">
+              <CopyableUrl href="https://console.cloud.google.com/auth/overview" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Создать OAuth-клиент.</span> На экране обзора (после шага 3) в блоке
+            «Metrics» справа нажмите «Create OAuth client». Если кнопки нет — тот же раздел через «Clients».
+            <div className="mt-2">
+              <CopyableUrl href="https://console.cloud.google.com/auth/overview" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Тип Desktop.</span> В «Application type» выберите{' '}
+            <span className="text-industrial-text">Desktop app</span>, имя можно не менять → OK.
+            <div className="mt-2">
+              <CopyableUrl href="https://console.cloud.google.com/auth/clients" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Client ID и Secret в программу.</span> Откройте созданное
+            приложение (синее имя в списке), скопируйте <span className="text-industrial-text">Client ID</span> и{' '}
+            <span className="text-industrial-text">Client secret</span> и вставьте в форму «Новый профиль» выше.
+            <div className="mt-2">
+              <CopyableUrl href="https://console.cloud.google.com/auth/clients" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">YouTube Data API v3.</span> Включите API кнопкой Enable.
+            <div className="mt-1">
+              <CopyableUrl href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Области (scopes).</span> Откройте раздел scopes → «Add or remove
+            scopes» → отметьте все пункты, где фигурирует <span className="text-industrial-text">YouTube Data API v3</span>
+            . Ниже нажмите <span className="text-industrial-text">Update</span>, затем ещё ниже{' '}
+            <span className="text-industrial-text">Save</span>.
+            <div className="mt-2">
+              <CopyableUrl href="https://console.cloud.google.com/auth/scopes" />
+            </div>
+          </li>
+          <li className="pl-1">
+            <span className="text-industrial-text">Тестовые пользователи.</span> Раздел Audience → «Test users» → «+
+            Add users». Сюда нужно добавлять <span className="text-industrial-text">каждую почту Google-аккаунта</span>
+            , с которой будете подключать канал к этому OAuth-приложению (пока приложение в режиме тестирования).
+            <div className="mt-2">
+              <CopyableUrl href="https://console.cloud.google.com/auth/audience" />
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      <div className="border border-industrial-border bg-industrial-panel p-4">
+        <div className="text-sm font-medium text-industrial-text">ADS Power Local API</div>
+        <div className="mt-4 grid max-w-2xl gap-3">
+          <label className="grid gap-1 text-xs text-industrial-muted">
+            Base URL (локальный API)
+            <input
+              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
+              value={adspower_api_base_url}
+              onChange={(ev) => setAdsPowerApiBaseUrl(ev.target.value)}
+              placeholder="http://local.adspower.net:50325"
+              autoComplete="off"
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-industrial-muted">
+            API Key (Bearer token)
+            <input
+              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
+              value={adspower_api_key}
+              onChange={(ev) => setAdsPowerApiKey(ev.target.value)}
+              autoComplete="off"
+            />
+          </label>
+        </div>
+      </div>
+
+      <div className="border border-industrial-border bg-industrial-panel p-4">
+        <div className="text-sm font-medium text-industrial-text">AI генерация (g4f / OpenAI-compatible)</div>
+        <div className="mt-4 grid max-w-2xl gap-3">
+          <label className="grid gap-1 text-xs text-industrial-muted">
+            API Base URL
+            <input
+              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
+              value={g4f_api_base_url}
+              onChange={(ev) => setG4fApiBaseUrl(ev.target.value)}
+              placeholder="http://127.0.0.1:1337/v1"
+              autoComplete="off"
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-industrial-muted">
+            Model
+            <input
+              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
+              value={g4f_model}
+              onChange={(ev) => setG4fModel(ev.target.value)}
+              placeholder="gpt-4o-mini"
+              autoComplete="off"
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-industrial-muted">
+            API Key (опционально)
+            <input
+              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
+              value={g4f_api_key}
+              onChange={(ev) => setG4fApiKey(ev.target.value)}
+              autoComplete="off"
+            />
+          </label>
+        </div>
+      </div>
+
+      <div className="border border-industrial-border bg-industrial-panel p-4">
+        <div className="text-sm font-medium text-industrial-text">Telegram</div>
 
         <div className="mt-4 grid max-w-2xl gap-3">
           <label className="grid gap-1 text-xs text-industrial-muted">
-            Telegram: токен бота (например 123456:ABC…)
+            Токен бота (например 123456:ABC…)
             <input
               className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
               value={telegram_bot_token}
@@ -224,7 +380,7 @@ export function SettingsPage(): JSX.Element {
             />
           </label>
           <label className="grid gap-1 text-xs text-industrial-muted">
-            Telegram: chat_id (личный чат, группа или канал)
+            chat_id (личный чат, группа или канал)
             <input
               className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
               value={telegram_chat_id}
@@ -232,110 +388,19 @@ export function SettingsPage(): JSX.Element {
               autoComplete="off"
             />
           </label>
-          <label className="grid gap-1 text-xs text-industrial-muted">
-            Google OAuth Client ID (Desktop), единый — app_settings
-            <input
-              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
-              value={google_oauth_client_id}
-              onChange={(ev) => setGoogleClientId(ev.target.value)}
-              autoComplete="off"
-            />
-          </label>
-          <label className="grid gap-1 text-xs text-industrial-muted">
-            Google OAuth Client Secret — app_settings
-            <input
-              type="password"
-              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
-              value={google_oauth_client_secret}
-              onChange={(ev) => setGoogleClientSecret(ev.target.value)}
-              autoComplete="off"
-            />
-          </label>
-          <label className="grid gap-1 text-xs text-industrial-muted">
-            Пауза между загрузками (секунды)
-            <input
-              type="number"
-              min={0}
-              max={3600}
-              className="border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
-              value={upload_cooldown_seconds}
-              onChange={(ev) => setUploadCooldownSeconds(ev.target.value)}
-              onWheel={(ev) => (ev.currentTarget as HTMLInputElement).blur()}
-            />
-          </label>
         </div>
 
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => void onSaveTelegramAndCooldown()}
+            onClick={() => void onSaveTelegram()}
             disabled={loading}
             className="border border-industrial-border bg-industrial-raised px-3 py-2 text-sm text-industrial-text hover:bg-industrial-panel disabled:opacity-50"
           >
-            Сохранить Telegram + КД
-          </button>
-          <button
-            type="button"
-            onClick={() => void onSaveLegacyOAuth()}
-            disabled={loading}
-            className="border border-industrial-border bg-industrial-raised px-3 py-2 text-sm text-industrial-text hover:bg-industrial-panel disabled:opacity-50"
-          >
-            Сохранить legacy OAuth
+            Сохранить Telegram
           </button>
           {status ? <span className="text-xs text-industrial-muted">{status}</span> : null}
         </div>
-      </div>
-
-      <div className="border border-industrial-border bg-industrial-panel p-4">
-        <div className="text-sm font-medium text-industrial-text">Google Cloud Console — пошагово</div>
-        <p className="mt-1 text-xs text-industrial-dim">
-          Повторите для каждого нового Cloud-проекта: свой OAuth Desktop client → новая строка в «OAuth-профили».
-        </p>
-
-        <ol className="mt-4 list-decimal space-y-3 pl-5 text-xs text-industrial-muted">
-          <li>
-            Откройте {LINK('https://console.cloud.google.com/', 'Google Cloud Console')} и выберите проект или
-            создайте новый: {LINK('https://console.cloud.google.com/projectcreate', 'Создать проект')}.
-          </li>
-          <li>
-            Включите API: {LINK('https://console.cloud.google.com/apis/library/youtube.googleapis.com', 'YouTube Data API v3')}{' '}
-            → <span className="text-industrial-text">Enable</span>.
-          </li>
-          <li>
-            Настройте экран согласия OAuth:{' '}
-            {LINK('https://console.cloud.google.com/apis/credentials/consent', 'APIs & Services → OAuth consent screen')}.
-            Тип обычно <span className="text-industrial-text">External</span>.
-          </li>
-          <li>
-            Scopes:{' '}
-            {LINK('https://developers.google.com/youtube/v3/guides/auth/installed-apps', 'YouTube: installed app')},{' '}
-            {LINK('https://developers.google.com/identity/protocols/oauth2/scopes#youtube', 'Scopes for YouTube')}.
-            Для загрузки видео достаточно{' '}
-            <code className="text-industrial-text">youtube.upload</code>; для эфиров и метаданных Live в приложении
-            запрашивается полный{' '}
-            <code className="text-industrial-text">https://www.googleapis.com/auth/youtube</code> (и force-ssl) —
-            добавьте эти области в экран согласия, иначе будет 403 insufficient scopes.
-          </li>
-          <li>
-            Учётные данные:{' '}
-            {LINK('https://console.cloud.google.com/apis/credentials', 'APIs & Services → Credentials')} →{' '}
-            <span className="text-industrial-text">OAuth client ID</span> → тип{' '}
-            <span className="text-industrial-text">Desktop app</span>. Вставьте пару в новый OAuth-профиль здесь.
-          </li>
-          <li>
-            {LINK('https://developers.google.com/identity/protocols/oauth2/native-app', 'OAuth 2.0 for Native Apps')},{' '}
-            {LINK('https://developers.google.com/identity/protocols/oauth2', 'Using OAuth 2.0 to Access Google APIs')}.
-          </li>
-          <li>
-            {LINK('https://developers.google.com/youtube/v3/guides/uploading_a_video', 'Uploading a video')}.
-          </li>
-        </ol>
-
-        <p className="mt-4 text-xs text-industrial-dim">
-          Дальше в приложении: окно входа Google → authorization code → refresh_token на канал, с привязкой к{' '}
-          <span className="text-industrial-text">oauth_profile_id</span> этого канала (реализация OAuth в коде —
-          следующий этап).
-        </p>
       </div>
     </div>
   )

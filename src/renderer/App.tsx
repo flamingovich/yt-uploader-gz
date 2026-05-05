@@ -37,9 +37,9 @@ const nav: { id: NavId; label: string; icon: typeof LayoutDashboard; subtitle: s
   { id: 'logs', label: 'Журнал', icon: ScrollText, subtitle: 'События и Telegram' },
   {
     id: 'settings',
-    label: 'Настройки',
+    label: 'OAuth-Профили',
     icon: Settings,
-    subtitle: 'Telegram · OAuth-профили (до 10 каналов на профиль) · Google Console'
+    subtitle: 'OAuth в Google Cloud · Telegram'
   }
 ]
 

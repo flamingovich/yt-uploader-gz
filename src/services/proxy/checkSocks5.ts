@@ -6,6 +6,8 @@ export type Socks5CheckResult =
       ok: true
       ip: string
       country: string
+      /** ISO 3166-1 alpha-2 из ipwho.is (для флага в UI). */
+      country_code?: string
       city: string
       region: string
       isp?: string
@@ -103,6 +105,7 @@ export async function checkSocks5Proxy(opts: {
       success?: boolean
       message?: string
       country?: string
+      country_code?: string
       city?: string
       region?: string
       connection?: { isp?: string }
@@ -113,16 +116,23 @@ export async function checkSocks5Proxy(opts: {
         ok: true,
         ip,
         country: '?',
+        country_code: typeof geo.country_code === 'string' ? geo.country_code : undefined,
         city: '?',
         region: geo.message ?? '?',
         isp: geo.connection?.isp
       }
     }
 
+    const cc =
+      typeof geo.country_code === 'string' && /^[A-Za-z]{2}$/.test(geo.country_code)
+        ? geo.country_code.toUpperCase()
+        : undefined
+
     return {
       ok: true,
       ip,
       country: geo.country ?? '?',
+      country_code: cc,
       city: geo.city ?? '?',
       region: geo.region ?? '?',
       isp: geo.connection?.isp

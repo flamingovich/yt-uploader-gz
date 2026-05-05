@@ -4,6 +4,9 @@ type ChannelListItem = {
   id: number
   proxy_id: number | null
   oauth_profile_id: number | null
+  ads_profile_id: string | null
+  /** Имя профиля ADS Power (Local API), для отображения. */
+  ads_profile_name: string | null
   oauth_profile_label: string | null
   youtube_channel_id: string | null
   channel_title: string | null
@@ -22,6 +25,9 @@ type ChannelListItem = {
   last_uploaded_at: string | null
   last_uploaded_video_id: string | null
   next_scheduled_publish_at: string | null
+  last_queue_activity_at: string | null
+  has_live_stream: number
+  upload_cooldown_seconds: number
   source_folder_path: string | null
   is_enabled: number
   created_at: string
@@ -86,6 +92,7 @@ type Socks5CheckResult =
       ok: true
       ip: string
       country: string
+      country_code?: string
       city: string
       region: string
       isp?: string
@@ -100,6 +107,7 @@ declare global {
   interface Window {
     electronAPI: {
       bootstrap(): Promise<{ ok: true }>
+      onDataChanged(cb: (payload: { actionType: string; at: number }) => void): () => void
       openExternalUrl(url: string): Promise<{ ok: true } | { ok: false; error: string }>
       dialog: {
         openDirectory(): Promise<string | null>
@@ -151,6 +159,7 @@ declare global {
         createChannel(payload: {
           proxy_id?: number | null
           oauth_profile_id?: number | null
+          ads_profile_id?: string | null
           channel_title: string
           source_folder_path?: string | null
         }): Promise<CreateResult<{ id: number }>>
@@ -170,6 +179,8 @@ declare global {
           schedule_randomize_minutes?: number
           schedule_timezone?: string
           source_folder_path?: string | null
+          upload_cooldown_seconds?: number
+          ads_profile_id?: string | null
         }): Promise<CreateResult<{ channelId: number }>>
         connectYouTube(payload: { channelId: number }): Promise<
           | CreateResult<{ youtube_channel_id: string; channel_title: string }>
@@ -177,6 +188,18 @@ declare global {
         >
         oauthBeginManual(payload: { channelId: number }): Promise<
           | CreateResult<{ flowId: string; authUrl: string }>
+          | { ok: false; error: string }
+        >
+        oauthBeginManualInAds(payload: { channelId: number }): Promise<
+          | CreateResult<{ flowId: string; authUrl: string }>
+          | { ok: false; error: string }
+        >
+        syncProxyFromAds(payload: { channelId: number }): Promise<
+          | CreateResult<{ mode: 'imported' | 'linked_existing' | 'no_proxy'; proxy_id: number | null; summary: string }>
+          | { ok: false; error: string }
+        >
+        oauthWaitManual(payload: { flowId: string; timeoutMs?: number }): Promise<
+          | CreateResult<{ channelId: number; youtube_channel_id: string; channel_title: string }>
           | { ok: false; error: string }
         >
         oauthFinishManual(payload: { flowId: string; callbackUrl: string }): Promise<
@@ -211,6 +234,7 @@ declare global {
           overlay_path?: string | null
           segments_folder_path?: string | null
           bumper_video_path?: string | null
+          bumper_pad_target_sec?: number | null
           ffmpeg_extra_args?: string | null
           youtube_broadcast_id?: string | null
           broadcast_title?: string | null
@@ -219,6 +243,10 @@ declare global {
           broadcast_privacy?: string
           broadcast_category_id?: string
           broadcast_thumb_path?: string | null
+          minecraft_prewarm_enabled?: number | boolean
+          minecraft_prewarm_chunks_folder?: string | null
+          minecraft_prewarm_audio_folder?: string | null
+          minecraft_prewarm_music_path?: string | null
         }): Promise<CreateResult<{ id: number }>>
         deleteStreamer(id: number): Promise<CreateResult<{ id: number }>>
       }
@@ -246,6 +274,19 @@ declare global {
           | { ok: false; error: string }
         >
       }
+      ai: {
+        generateChannelMeta(payload: {
+          channelId?: number
+          kind: 'description' | 'tags'
+          topicPrompt: string
+          language?: string
+          category?: string
+          madeForKids?: boolean
+        }): Promise<
+          | CreateResult<{ text: string; kind: 'description' | 'tags' }>
+          | { ok: false; error: string }
+        >
+      }
     }
   }
 }
@@ -260,6 +301,7 @@ type StreamerDetailRow = {
   overlay_path: string | null
   segments_folder_path: string | null
   bumper_video_path: string | null
+  bumper_pad_target_sec: number | null
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null
@@ -268,6 +310,10 @@ type StreamerDetailRow = {
   broadcast_privacy: string
   broadcast_category_id: string
   broadcast_thumb_path: string | null
+  minecraft_prewarm_enabled: number
+  minecraft_prewarm_chunks_folder: string | null
+  minecraft_prewarm_audio_folder: string | null
+  minecraft_prewarm_music_path: string | null
   last_viewer_count: number | null
   last_viewer_checked_at: string | null
   process_status: string
@@ -286,6 +332,7 @@ type StreamerListItem = {
   overlay_path: string | null
   segments_folder_path: string | null
   bumper_video_path: string | null
+  bumper_pad_target_sec: number | null
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null
@@ -294,6 +341,10 @@ type StreamerListItem = {
   broadcast_privacy: string
   broadcast_category_id: string
   broadcast_thumb_path: string | null
+  minecraft_prewarm_enabled: number
+  minecraft_prewarm_chunks_folder: string | null
+  minecraft_prewarm_audio_folder: string | null
+  minecraft_prewarm_music_path: string | null
   last_viewer_count: number | null
   last_viewer_checked_at: string | null
   process_status: string

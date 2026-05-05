@@ -21,9 +21,9 @@ function getDbPath(): string {
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1280,
+    width: 1600,
     height: 800,
-    minWidth: 960,
+    minWidth: 1200,
     minHeight: 600,
     backgroundColor: '#0f0f0f',
     show: false,

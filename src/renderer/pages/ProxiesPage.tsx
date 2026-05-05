@@ -1,5 +1,6 @@
 import { Loader2 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { ProxyStatusGlyph } from '../lib/proxyCheckDisplay'
 
 type ProxyRow = Awaited<ReturnType<typeof window.electronAPI.db.listProxies>>[number]
 type CreateProxyResult = Awaited<ReturnType<typeof window.electronAPI.db.createProxy>>
@@ -47,7 +48,10 @@ export function ProxiesPage(): JSX.Element {
   const [bulkNamePrefix, setBulkNamePrefix] = useState('Proxy')
   const [formCheck, setFormCheck] = useState<CheckResult | null>(null)
   const [checking, setChecking] = useState<'form' | number | 'bulk' | null>(null)
+  const [bulkChecking, setBulkChecking] = useState(false)
   const [showCreateForm, setShowCreateForm] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
+  const selectAllRef = useRef<HTMLInputElement>(null)
 
   const reload = useCallback(async () => {
     setRows(await window.electronAPI.db.listProxies())
@@ -56,6 +60,24 @@ export function ProxiesPage(): JSX.Element {
   useEffect(() => {
     void reload()
   }, [reload])
+
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      const ids = new Set(rows.map((r) => r.id))
+      const next = new Set<number>()
+      for (const id of prev) {
+        if (ids.has(id)) next.add(id)
+      }
+      return next
+    })
+  }, [rows])
+
+  useEffect(() => {
+    const el = selectAllRef.current
+    if (!el) return
+    const n = rows.filter((r) => selectedIds.has(r.id)).length
+    el.indeterminate = n > 0 && n < rows.length
+  }, [rows, selectedIds])
 
   async function runCheck(args: {
     host?: string
@@ -74,6 +96,36 @@ export function ProxiesPage(): JSX.Element {
       }
     } finally {
       setChecking(null)
+    }
+  }
+
+  function toggleRow(id: number): void {
+    setSelectedIds((prev) => {
+      const n = new Set(prev)
+      if (n.has(id)) n.delete(id)
+      else n.add(id)
+      return n
+    })
+  }
+
+  function toggleSelectAll(): void {
+    setSelectedIds((prev) => {
+      if (rows.length > 0 && rows.every((r) => prev.has(r.id))) {
+        return new Set()
+      }
+      return new Set(rows.map((r) => r.id))
+    })
+  }
+
+  async function checkSelectedProxies(): Promise<void> {
+    if (selectedIds.size === 0 || bulkChecking) return
+    setBulkChecking(true)
+    try {
+      for (const id of selectedIds) {
+        await runCheck({ persistId: id })
+      }
+    } finally {
+      setBulkChecking(false)
     }
   }
 
@@ -138,17 +190,13 @@ export function ProxiesPage(): JSX.Element {
     }
   }
 
+  const colCount = 9
+
   return (
     <div className="flex flex-col gap-4">
       <div className="border border-industrial-border bg-industrial-panel p-4">
         <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm font-medium text-industrial-text">SOCKS5-прокси</div>
-            <p className="mt-1 text-xs text-industrial-dim">
-              Поддерживается только <span className="text-industrial-text">SOCKS5</span> (логин и пароль
-              опциональны). Host и порт должны быть уникальны.
-            </p>
-          </div>
+          <div className="text-sm font-medium text-industrial-text">SOCKS5-прокси</div>
           <button
             type="button"
             onClick={() => setShowCreateForm((v) => !v)}
@@ -318,10 +366,34 @@ export function ProxiesPage(): JSX.Element {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto border border-industrial-border bg-industrial-panel">
+        <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b border-industrial-border bg-industrial-raised px-2 py-2 text-xs">
+          <button
+            type="button"
+            disabled={selectedIds.size === 0 || bulkChecking || checking !== null}
+            onClick={() => void checkSelectedProxies()}
+            className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-2 py-1.5 text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+          >
+            {bulkChecking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            Проверить выбранные ({selectedIds.size})
+          </button>
+        </div>
         <table className="w-full border-collapse text-left text-xs">
-          <thead className="sticky top-0 bg-industrial-raised text-industrial-muted">
+          <thead className="sticky top-[41px] z-10 bg-industrial-raised text-industrial-muted">
             <tr>
+              <th className="w-10 border-b border-industrial-border px-1 py-2 font-medium">
+                <input
+                  ref={selectAllRef}
+                  type="checkbox"
+                  className="accent-industrial-text"
+                  title="Выбрать все / снять всё"
+                  checked={rows.length > 0 && rows.every((r) => selectedIds.has(r.id))}
+                  onChange={() => toggleSelectAll()}
+                />
+              </th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">ID</th>
+              <th className="w-10 border-b border-industrial-border px-1 py-2 font-medium" title="Страна по последней проверке">
+                {' '}
+              </th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Тип</th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Название</th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Адрес</th>
@@ -333,14 +405,25 @@ export function ProxiesPage(): JSX.Element {
           <tbody className="text-industrial-text">
             {rows.length === 0 ? (
               <tr>
-                <td className="px-2 py-3 text-industrial-dim" colSpan={7}>
+                <td className="px-2 py-3 text-industrial-dim" colSpan={colCount}>
                   Прокси ещё не добавлены — сначала создайте запись выше.
                 </td>
               </tr>
             ) : (
               rows.map((r) => (
                 <tr key={r.id} className="border-b border-industrial-border">
+                  <td className="px-1 py-2">
+                    <input
+                      type="checkbox"
+                      className="accent-industrial-text"
+                      checked={selectedIds.has(r.id)}
+                      onChange={() => toggleRow(r.id)}
+                    />
+                  </td>
                   <td className="px-2 py-2 font-mono text-industrial-muted">{r.id}</td>
+                  <td className="px-1 py-2">
+                    <ProxyStatusGlyph lastCheckStatus={r.last_check_status} />
+                  </td>
                   <td className="px-2 py-2 font-mono text-industrial-muted">{r.scheme}</td>
                   <td className="px-2 py-2">{r.name ?? '—'}</td>
                   <td className="px-2 py-2 font-mono">
@@ -351,7 +434,7 @@ export function ProxiesPage(): JSX.Element {
                   <td className="px-2 py-2">
                     <button
                       type="button"
-                      disabled={checking === r.id}
+                      disabled={checking === r.id || bulkChecking}
                       onClick={() => void runCheck({ persistId: r.id })}
                       className="inline-flex items-center gap-1 border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-50"
                     >

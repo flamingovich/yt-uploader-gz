@@ -330,6 +330,7 @@ export function pickPreferredBroadcastId(items: LiveBroadcastSummary[]): string 
     livestarting: 95,
     testing: 85,
     teststarting: 80,
+    upcoming: 55,
     ready: 50,
     created: 40
   }
