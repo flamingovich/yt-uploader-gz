@@ -14,6 +14,14 @@ export type Socks5CheckResult =
     }
   | { ok: false; error: string }
 
+export type Socks5UploadSpeedResult =
+  | {
+      ok: true
+      upload_mbps_avg: number
+      upload_test_sec: number
+    }
+  | { ok: false; error: string }
+
 function buildSocks5Url(
   host: string,
   port: number,
@@ -52,6 +60,68 @@ function httpsGet(url: string, agent: SocksProxyAgent, timeoutMs: number): Promi
       reject(e)
     })
   })
+}
+
+async function measureSocks5UploadMbps(input: {
+  agent: SocksProxyAgent
+  timeoutMs: number
+  durationSec: number
+}): Promise<{ mbpsAvg: number; elapsedSec: number }> {
+  const { agent, timeoutMs, durationSec } = input
+  const targetMs = Math.max(1, Math.floor(durationSec * 1000))
+  const chunk = Buffer.alloc(64 * 1024, 120)
+  const startedAt = Date.now()
+  let bytesWritten = 0
+
+  const elapsedMs = (): number => Date.now() - startedAt
+
+  await new Promise<void>((resolve, reject) => {
+    const req = https.request(
+      'https://httpbin.org/post',
+      {
+        method: 'POST',
+        agent,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'transfer-encoding': 'chunked',
+          connection: 'close'
+        }
+      },
+      (res) => {
+        res.on('data', () => {
+          /* ignore body */
+        })
+        res.on('end', () => resolve())
+      }
+    )
+    const killer = setTimeout(() => {
+      req.destroy(new Error(`Таймаут upload-теста ${timeoutMs} мс`))
+    }, timeoutMs)
+    req.on('error', (e) => {
+      clearTimeout(killer)
+      reject(e)
+    })
+    req.on('close', () => {
+      clearTimeout(killer)
+    })
+
+    const pump = (): void => {
+      while (elapsedMs() < targetMs) {
+        const ok = req.write(chunk)
+        bytesWritten += chunk.length
+        if (!ok) {
+          req.once('drain', pump)
+          return
+        }
+      }
+      req.end()
+    }
+    pump()
+  })
+
+  const elapsedSec = Math.max(0.001, elapsedMs() / 1000)
+  const mbpsAvg = (bytesWritten * 8) / elapsedSec / 1_000_000
+  return { mbpsAvg, elapsedSec }
 }
 
 export async function checkSocks5UrlReachability(opts: {
@@ -140,5 +210,29 @@ export async function checkSocks5Proxy(opts: {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     return { ok: false, error: msg }
+  }
+}
+
+export async function checkSocks5ProxyUploadSpeed(opts: {
+  host: string
+  port: number
+  login?: string | null
+  password?: string | null
+  timeoutMs?: number
+  durationSec?: number
+}): Promise<Socks5UploadSpeedResult> {
+  const timeoutMs = opts.timeoutMs ?? 35000
+  const durationSec = opts.durationSec ?? 12
+  try {
+    const u = buildSocks5Url(opts.host, opts.port, opts.login, opts.password)
+    const agent = new SocksProxyAgent(u, { timeout: timeoutMs })
+    const uploadProbe = await measureSocks5UploadMbps({ agent, timeoutMs, durationSec })
+    return {
+      ok: true,
+      upload_mbps_avg: Number(uploadProbe.mbpsAvg.toFixed(2)),
+      upload_test_sec: Number(uploadProbe.elapsedSec.toFixed(1))
+    }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
   }
 }

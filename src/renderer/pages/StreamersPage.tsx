@@ -12,18 +12,15 @@ type ProxyRow = Awaited<ReturnType<typeof window.electronAPI.db.listProxies>>[nu
 function bumperPadTargetSecFromForm(props: {
   bumperPadMode: 'legacy' | 'once' | 'custom'
   bumperPadAmount: number
-  bumperPadUnit: 'sec' | 'min'
 }): number | null {
   if (props.bumperPadMode === 'legacy') return null
   if (props.bumperPadMode === 'once') return 0
   const n = Math.max(1, Math.floor(Number(props.bumperPadAmount) || 1))
-  const mult = props.bumperPadUnit === 'min' ? 60 : 1
-  const sec = n * mult
+  const sec = n * 60
   if (!Number.isFinite(sec) || sec < 1) return null
   return Math.min(sec, 24 * 3600)
 }
 
-const BUMPER_AMOUNT_OPTIONS_SEC = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 600, 900, 1200]
 const BUMPER_AMOUNT_OPTIONS_MIN = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60]
 
 function statusLabel(s: string): string {
@@ -55,9 +52,13 @@ export function StreamersPage(): JSX.Element {
   const [proxyId, setProxyId] = useState<number | '' | 'inherit'>('inherit')
   const [ingest, setIngest] = useState('rtmp://a.rtmp.youtube.com/live2')
   const [streamKey, setStreamKey] = useState('')
+  const [streamMode, setStreamMode] = useState<'random' | 'ordered' | 'single'>('random')
   const [segmentsDir, setSegmentsDir] = useState('')
+  const [singleSegmentPath, setSingleSegmentPath] = useState('')
   const [bumperPath, setBumperPath] = useState('')
   const [overlayPath, setOverlayPath] = useState('')
+  const [videoBitrateKbps, setVideoBitrateKbps] = useState(6000)
+  const [videoBitrateMode, setVideoBitrateMode] = useState<'cbr' | 'vbr'>('cbr')
   const [ffmpegExtra, setFfmpegExtra] = useState('')
   const [broadcastId, setBroadcastId] = useState('')
   const [bTitle, setBTitle] = useState('')
@@ -66,14 +67,9 @@ export function StreamersPage(): JSX.Element {
   const [bPrivacy, setBPrivacy] = useState<'private' | 'public' | 'unlisted'>('private')
   const [bCategory, setBCategory] = useState('22')
   const [bThumbPath, setBThumbPath] = useState('')
-  /** legacy | once | custom (тогда считаем из bumperPadAmount + bumperPadUnit) */
+  /** legacy | once | custom (для custom считаем минуты -> секунды) */
   const [bumperPadMode, setBumperPadMode] = useState<'legacy' | 'once' | 'custom'>('legacy')
   const [bumperPadAmount, setBumperPadAmount] = useState(3)
-  const [bumperPadUnit, setBumperPadUnit] = useState<'sec' | 'min'>('min')
-  const [mcPrewarmEnabled, setMcPrewarmEnabled] = useState(false)
-  const [mcChunksDir, setMcChunksDir] = useState('')
-  const [mcAudioDir, setMcAudioDir] = useState('')
-  const [mcMusicPath, setMcMusicPath] = useState('')
 
   const reload = useCallback(async () => {
     const [s, ch, pr] = await Promise.all([
@@ -104,9 +100,13 @@ export function StreamersPage(): JSX.Element {
     setProxyId('inherit')
     setIngest('rtmp://a.rtmp.youtube.com/live2')
     setStreamKey('')
+    setStreamMode('random')
     setSegmentsDir('')
+    setSingleSegmentPath('')
     setBumperPath('')
     setOverlayPath('')
+    setVideoBitrateKbps(6000)
+    setVideoBitrateMode('cbr')
     setFfmpegExtra('')
     setBroadcastId('')
     setBTitle('')
@@ -117,11 +117,6 @@ export function StreamersPage(): JSX.Element {
     setBThumbPath('')
     setBumperPadMode('legacy')
     setBumperPadAmount(3)
-    setBumperPadUnit('min')
-    setMcPrewarmEnabled(false)
-    setMcChunksDir('')
-    setMcAudioDir('')
-    setMcMusicPath('')
   }
 
   function openCreate(): void {
@@ -144,9 +139,15 @@ export function StreamersPage(): JSX.Element {
       setProxyId(r.proxy_id == null ? 'inherit' : r.proxy_id)
       setIngest(r.rtmp_ingest_url)
       setStreamKey(r.rtmp_stream_key)
+      setStreamMode(r.stream_mode === 'ordered' || r.stream_mode === 'single' ? r.stream_mode : 'random')
       setSegmentsDir(r.segments_folder_path ?? '')
+      setSingleSegmentPath(r.single_segment_path ?? '')
       setBumperPath(r.bumper_video_path ?? '')
       setOverlayPath(r.overlay_path ?? '')
+      setVideoBitrateKbps(
+        Number.isFinite(Number(r.video_bitrate_kbps)) ? Math.max(200, Number(r.video_bitrate_kbps)) : 6000
+      )
+      setVideoBitrateMode(r.video_bitrate_mode === 'vbr' ? 'vbr' : 'cbr')
       setFfmpegExtra(r.ffmpeg_extra_args ?? '')
       setBroadcastId(r.youtube_broadcast_id ?? '')
       setBTitle(r.broadcast_title ?? '')
@@ -165,19 +166,9 @@ export function StreamersPage(): JSX.Element {
           setBumperPadMode('once')
         } else {
           setBumperPadMode('custom')
-          if (sec % 60 === 0 && sec >= 60 && sec <= 7200) {
-            setBumperPadUnit('min')
-            setBumperPadAmount(Math.round(sec / 60))
-          } else {
-            setBumperPadUnit('sec')
-            setBumperPadAmount(sec)
-          }
+          setBumperPadAmount(Math.max(1, Math.round(sec / 60)))
         }
       }
-      setMcPrewarmEnabled(Number(r.minecraft_prewarm_enabled) === 1)
-      setMcChunksDir(r.minecraft_prewarm_chunks_folder ?? '')
-      setMcAudioDir(r.minecraft_prewarm_audio_folder ?? '')
-      setMcMusicPath(r.minecraft_prewarm_music_path ?? '')
       setShowForm(true)
     } finally {
       setBusyId(null)
@@ -218,12 +209,20 @@ export function StreamersPage(): JSX.Element {
           setIngest={setIngest}
           streamKey={streamKey}
           setStreamKey={setStreamKey}
+          streamMode={streamMode}
+          setStreamMode={setStreamMode}
           segmentsDir={segmentsDir}
           setSegmentsDir={setSegmentsDir}
+          singleSegmentPath={singleSegmentPath}
+          setSingleSegmentPath={setSingleSegmentPath}
           bumperPath={bumperPath}
           setBumperPath={setBumperPath}
           overlayPath={overlayPath}
           setOverlayPath={setOverlayPath}
+          videoBitrateKbps={videoBitrateKbps}
+          setVideoBitrateKbps={setVideoBitrateKbps}
+          videoBitrateMode={videoBitrateMode}
+          setVideoBitrateMode={setVideoBitrateMode}
           ffmpegExtra={ffmpegExtra}
           setFfmpegExtra={setFfmpegExtra}
           broadcastId={broadcastId}
@@ -244,16 +243,6 @@ export function StreamersPage(): JSX.Element {
           setBumperPadMode={setBumperPadMode}
           bumperPadAmount={bumperPadAmount}
           setBumperPadAmount={setBumperPadAmount}
-          bumperPadUnit={bumperPadUnit}
-          setBumperPadUnit={setBumperPadUnit}
-          mcPrewarmEnabled={mcPrewarmEnabled}
-          setMcPrewarmEnabled={setMcPrewarmEnabled}
-          mcChunksDir={mcChunksDir}
-          setMcChunksDir={setMcChunksDir}
-          mcAudioDir={mcAudioDir}
-          setMcAudioDir={setMcAudioDir}
-          mcMusicPath={mcMusicPath}
-          setMcMusicPath={setMcMusicPath}
           channels={channels}
           proxies={proxies}
           busyId={busyId}
@@ -337,7 +326,7 @@ export function StreamersPage(): JSX.Element {
                       onClick={() => void openEdit(r.id)}
                       className="border border-industrial-border px-2 py-1 text-[11px] hover:bg-industrial-raised disabled:opacity-50"
                     >
-                      Изменить
+                      Настройки
                     </button>
                     {r.process_status === 'live' || r.process_status === 'starting' ? (
                       <>
@@ -444,12 +433,20 @@ function StreamerEditorForm(props: {
   setIngest: (v: string) => void
   streamKey: string
   setStreamKey: (v: string) => void
+  streamMode: 'random' | 'ordered' | 'single'
+  setStreamMode: (v: 'random' | 'ordered' | 'single') => void
   segmentsDir: string
   setSegmentsDir: (v: string) => void
+  singleSegmentPath: string
+  setSingleSegmentPath: (v: string) => void
   bumperPath: string
   setBumperPath: (v: string) => void
   overlayPath: string
   setOverlayPath: (v: string) => void
+  videoBitrateKbps: number
+  setVideoBitrateKbps: (v: number) => void
+  videoBitrateMode: 'cbr' | 'vbr'
+  setVideoBitrateMode: (v: 'cbr' | 'vbr') => void
   ffmpegExtra: string
   setFfmpegExtra: (v: string) => void
   broadcastId: string
@@ -470,16 +467,6 @@ function StreamerEditorForm(props: {
   setBumperPadMode: (v: 'legacy' | 'once' | 'custom') => void
   bumperPadAmount: number
   setBumperPadAmount: (v: number) => void
-  bumperPadUnit: 'sec' | 'min'
-  setBumperPadUnit: (v: 'sec' | 'min') => void
-  mcPrewarmEnabled: boolean
-  setMcPrewarmEnabled: (v: boolean) => void
-  mcChunksDir: string
-  setMcChunksDir: (v: string) => void
-  mcAudioDir: string
-  setMcAudioDir: (v: string) => void
-  mcMusicPath: string
-  setMcMusicPath: (v: string) => void
   channels: ChannelRow[]
   proxies: ProxyRow[]
   busyId: number | 'save' | null
@@ -530,9 +517,13 @@ function StreamerEditorForm(props: {
           id,
           rtmp_ingest_url: props.ingest.trim(),
           rtmp_stream_key: props.streamKey.trim(),
-          segments_folder_path: props.segmentsDir.trim() || null,
+          segments_folder_path: props.streamMode === 'single' ? null : props.segmentsDir.trim() || null,
+          stream_mode: props.streamMode,
+          single_segment_path: props.streamMode === 'single' ? props.singleSegmentPath.trim() || null : null,
           bumper_video_path: props.bumperPath.trim() || null,
           overlay_path: props.overlayPath.trim() || null,
+          video_bitrate_kbps: Math.max(200, Math.min(50000, Math.floor(props.videoBitrateKbps || 6000))),
+          video_bitrate_mode: props.videoBitrateMode,
           ffmpeg_extra_args: props.ffmpegExtra.trim() || null,
           youtube_broadcast_id: props.broadcastId.trim() || null,
           broadcast_title: props.bTitle.trim() || null,
@@ -542,10 +533,10 @@ function StreamerEditorForm(props: {
           broadcast_category_id: props.bCategory.trim() || '22',
           broadcast_thumb_path: props.bThumbPath.trim() || null,
           bumper_pad_target_sec: bumperPadTargetSecFromForm(props),
-          minecraft_prewarm_enabled: props.mcPrewarmEnabled ? 1 : 0,
-          minecraft_prewarm_chunks_folder: props.mcChunksDir.trim() || null,
-          minecraft_prewarm_audio_folder: props.mcAudioDir.trim() || null,
-          minecraft_prewarm_music_path: props.mcMusicPath.trim() || null
+          minecraft_prewarm_enabled: 0,
+          minecraft_prewarm_chunks_folder: null,
+          minecraft_prewarm_audio_folder: null,
+          minecraft_prewarm_music_path: null
         })
         if (!up.ok) props.setError(up.error)
         else await props.onSaved()
@@ -557,9 +548,13 @@ function StreamerEditorForm(props: {
           proxy_id: proxy,
           rtmp_ingest_url: props.ingest.trim(),
           rtmp_stream_key: props.streamKey.trim(),
-          segments_folder_path: props.segmentsDir.trim() || null,
+          segments_folder_path: props.streamMode === 'single' ? null : props.segmentsDir.trim() || null,
+          stream_mode: props.streamMode,
+          single_segment_path: props.streamMode === 'single' ? props.singleSegmentPath.trim() || null : null,
           bumper_video_path: props.bumperPath.trim() || null,
           overlay_path: props.overlayPath.trim() || null,
+          video_bitrate_kbps: Math.max(200, Math.min(50000, Math.floor(props.videoBitrateKbps || 6000))),
+          video_bitrate_mode: props.videoBitrateMode,
           ffmpeg_extra_args: props.ffmpegExtra.trim() || null,
           youtube_broadcast_id: props.broadcastId.trim() || null,
           broadcast_title: props.bTitle.trim() || null,
@@ -569,10 +564,10 @@ function StreamerEditorForm(props: {
           broadcast_category_id: props.bCategory.trim() || '22',
           broadcast_thumb_path: props.bThumbPath.trim() || null,
           bumper_pad_target_sec: bumperPadTargetSecFromForm(props),
-          minecraft_prewarm_enabled: props.mcPrewarmEnabled ? 1 : 0,
-          minecraft_prewarm_chunks_folder: props.mcChunksDir.trim() || null,
-          minecraft_prewarm_audio_folder: props.mcAudioDir.trim() || null,
-          minecraft_prewarm_music_path: props.mcMusicPath.trim() || null
+          minecraft_prewarm_enabled: 0,
+          minecraft_prewarm_chunks_folder: null,
+          minecraft_prewarm_audio_folder: null,
+          minecraft_prewarm_music_path: null
         })
         if (!up.ok) props.setError(up.error)
         else await props.onSaved()
@@ -657,23 +652,71 @@ function StreamerEditorForm(props: {
           />
         </label>
         <label className="flex flex-col gap-1 md:col-span-2">
-          <span className="text-industrial-muted">Папка с кусками (видео)</span>
-          {props.mcPrewarmEnabled ? (
+          <span className="text-industrial-muted">Режим стрима</span>
+          <select
+            value={props.streamMode}
+            onChange={(e) =>
+              props.setStreamMode(
+                e.target.value === 'ordered' || e.target.value === 'single' ? e.target.value : 'random'
+              )
+            }
+            className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
+          >
+            <option value="random">Рандомный микс кусков</option>
+            <option value="ordered">Куски по порядку (1.mp4, 2.mp4, ...)</option>
+            <option value="single">Один кусок (выбранный mp4 файл)</option>
+          </select>
+        </label>
+        <div className="md:col-span-2">
+          <button
+            type="button"
+            onClick={async () => {
+              props.setError(null)
+              const r = await window.electronAPI.streamers.openPreview({
+                channel_id: props.channelId === '' ? undefined : props.channelId,
+                stream_mode: props.streamMode,
+                segments_folder_path: props.segmentsDir.trim() || null,
+                single_segment_path: props.singleSegmentPath.trim() || null,
+                overlay_path: props.overlayPath.trim() || null,
+                bumper_video_path: props.bumperPath.trim() || null,
+                video_bitrate_kbps: Math.max(200, Math.min(50000, Math.floor(props.videoBitrateKbps || 6000))),
+                video_bitrate_mode: props.videoBitrateMode,
+                ffmpeg_extra_args: props.ffmpegExtra.trim() || null
+              })
+              if (!r.ok) props.setError(r.error)
+            }}
+            className="border border-industrial-border bg-industrial-bg px-3 py-1.5 text-xs text-industrial-text hover:border-industrial-muted"
+          >
+            Предпросмотр стрима
+          </button>
+        </div>
+        <label className="flex flex-col gap-1 md:col-span-2">
+          <span className="text-industrial-muted">
+            {props.streamMode === 'single' ? 'Файл куска (.mp4)' : 'Папка с кусками (видео)'}
+          </span>
+          {props.streamMode === 'ordered' ? (
             <span className="text-[10px] text-industrial-dim">
-              При включённом «Майнкрафт прогрев» эта папка не используется для эфира — берётся отдельная ниже.
+              Порядок берётся по имени файла в естественной сортировке: 1.mp4, 2.mp4, 10.mp4.
             </span>
           ) : null}
           <div className="flex gap-2">
             <input
               readOnly
-              value={props.segmentsDir}
+              value={props.streamMode === 'single' ? props.singleSegmentPath : props.segmentsDir}
               className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
             />
             <button
               type="button"
               onClick={async () => {
-                const p = await window.electronAPI.dialog.openDirectory()
-                if (p) props.setSegmentsDir(p)
+                if (props.streamMode === 'single') {
+                  const p = await window.electronAPI.dialog.openFile({
+                    filters: [{ name: 'Видео', extensions: ['mp4'] }]
+                  })
+                  if (p) props.setSingleSegmentPath(p)
+                } else {
+                  const p = await window.electronAPI.dialog.openDirectory()
+                  if (p) props.setSegmentsDir(p)
+                }
               }}
               className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
             >
@@ -704,7 +747,7 @@ function StreamerEditorForm(props: {
           </div>
           <div className="mt-2 flex flex-col gap-2 rounded border border-industrial-border/60 bg-industrial-bg/40 p-2">
             <span className="text-[10px] text-industrial-dim">
-              Как долго крутить заглушку перед основным циклом (если файл короче — зацикливается до указанного срока).
+              Как долго крутить заглушку перед основным циклом. Таймер задаётся в минутах.
             </span>
             <div className="flex flex-wrap items-center gap-2">
               <select
@@ -723,41 +766,16 @@ function StreamerEditorForm(props: {
                     onChange={(e) => props.setBumperPadAmount(Number(e.target.value))}
                     className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
                   >
-                    {(() => {
-                      const opts =
-                        props.bumperPadUnit === 'min' ? BUMPER_AMOUNT_OPTIONS_MIN : BUMPER_AMOUNT_OPTIONS_SEC
-                      const ok = opts.includes(props.bumperPadAmount)
-                      return (
-                        <>
-                          {!ok ? (
-                            <option value={String(props.bumperPadAmount)}>
-                              {props.bumperPadAmount} ({props.bumperPadUnit === 'min' ? 'мин' : 'сек'}, из сохранённых)
-                            </option>
-                          ) : null}
-                          {opts.map((n) => (
-                            <option key={n} value={String(n)}>
-                              {n}
-                            </option>
-                          ))}
-                        </>
-                      )
-                    })()}
+                    {!BUMPER_AMOUNT_OPTIONS_MIN.includes(props.bumperPadAmount) ? (
+                      <option value={String(props.bumperPadAmount)}>{props.bumperPadAmount} (из сохранённых)</option>
+                    ) : null}
+                    {BUMPER_AMOUNT_OPTIONS_MIN.map((n) => (
+                      <option key={n} value={String(n)}>
+                        {n}
+                      </option>
+                    ))}
                   </select>
-                  <select
-                    value={props.bumperPadUnit}
-                    onChange={(e) => {
-                      const u = e.target.value as 'sec' | 'min'
-                      props.setBumperPadUnit(u)
-                      const opts = u === 'min' ? BUMPER_AMOUNT_OPTIONS_MIN : BUMPER_AMOUNT_OPTIONS_SEC
-                      if (!opts.includes(props.bumperPadAmount)) {
-                        props.setBumperPadAmount(opts[0]!)
-                      }
-                    }}
-                    className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
-                  >
-                    <option value="sec">секунд</option>
-                    <option value="min">минут</option>
-                  </select>
+                  <span className="text-industrial-dim">минут</span>
                 </>
               ) : null}
             </div>
@@ -765,11 +783,6 @@ function StreamerEditorForm(props: {
         </label>
         <label className="flex flex-col gap-1 md:col-span-2">
           <span className="text-industrial-muted">Оверлей (PNG/WebP или зацикленное видео MP4/MOV/…)</span>
-          {props.mcPrewarmEnabled ? (
-            <span className="text-[10px] text-industrial-dim">
-              При «Майнкрафт прогрев» оверлей в эфир не подмешивается — только полноэкранные куски 1080×1920.
-            </span>
-          ) : null}
           <div className="flex gap-2">
             <input
               readOnly
@@ -795,89 +808,32 @@ function StreamerEditorForm(props: {
             </button>
           </div>
         </label>
-        <div className="flex flex-col gap-2 rounded border border-industrial-border/60 bg-industrial-bg/30 p-3 md:col-span-2">
-          <label className="flex cursor-pointer items-center gap-2">
+        <label className="flex flex-col gap-1 md:col-span-2">
+          <span className="text-industrial-muted">Настройки видеобитрейта</span>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_180px]">
+            <select
+              value={props.videoBitrateMode}
+              onChange={(e) => props.setVideoBitrateMode(e.target.value === 'vbr' ? 'vbr' : 'cbr')}
+              className="border border-industrial-border bg-industrial-bg px-2 py-1.5"
+            >
+              <option value="cbr">CBR (постоянный, как сейчас)</option>
+              <option value="vbr">VBR (переменный)</option>
+            </select>
             <input
-              type="checkbox"
-              checked={props.mcPrewarmEnabled}
-              onChange={(e) => props.setMcPrewarmEnabled(e.target.checked)}
-              className="h-3.5 w-3.5 shrink-0"
+              value={String(props.videoBitrateKbps)}
+              onChange={(e) => {
+                const n = Number(e.target.value)
+                props.setVideoBitrateKbps(Number.isFinite(n) ? n : 6000)
+              }}
+              inputMode="numeric"
+              className="border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
+              placeholder="6000"
             />
-            <span className="text-industrial-muted">Майнкрафт прогрев (тест)</span>
-          </label>
-          {props.mcPrewarmEnabled ? (
-            <div className="flex flex-col gap-3 pl-1">
-              <p className="text-[10px] leading-snug text-industrial-dim">
-                Видео — на весь кадр 1080×1920 (оверлей из настроек не используется). Куски должны быть уже в этом
-                размере; ffmpeg лишь подрежет/масштабирует к 1080×1920 при отклонении. Shuffle как в основном цикле;
-                SFX — только .mp3, пауза 0.5–1.5 с между клипами, fade in/out ~0.2 с (кэш в temp). Музыка — один .mp3
-                (concat + микс с SFX на ~10% громкости относительно SFX).
-              </p>
-              <label className="flex flex-col gap-1">
-                <span className="text-industrial-muted">Папка с кусками (прогрев)</span>
-                <div className="flex gap-2">
-                  <input
-                    readOnly
-                    value={props.mcChunksDir}
-                    className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
-                  />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const p = await window.electronAPI.dialog.openDirectory()
-                      if (p) props.setMcChunksDir(p)
-                    }}
-                    className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
-                  >
-                    …
-                  </button>
-                </div>
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className="text-industrial-muted">Папка с аудио (SFX, только .mp3)</span>
-                <div className="flex gap-2">
-                  <input
-                    readOnly
-                    value={props.mcAudioDir}
-                    className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
-                  />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const p = await window.electronAPI.dialog.openDirectory()
-                      if (p) props.setMcAudioDir(p)
-                    }}
-                    className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
-                  >
-                    …
-                  </button>
-                </div>
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className="text-industrial-muted">Музыка на стриме (.mp3)</span>
-                <div className="flex gap-2">
-                  <input
-                    readOnly
-                    value={props.mcMusicPath}
-                    className="min-w-0 flex-1 border border-industrial-border bg-industrial-bg px-2 py-1.5 font-mono text-[11px]"
-                  />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const p = await window.electronAPI.dialog.openFile({
-                        filters: [{ name: 'MP3', extensions: ['mp3'] }]
-                      })
-                      if (p) props.setMcMusicPath(p)
-                    }}
-                    className="shrink-0 border border-industrial-border px-2 py-1 hover:bg-industrial-raised"
-                  >
-                    …
-                  </button>
-                </div>
-              </label>
-            </div>
-          ) : null}
-        </div>
+          </div>
+          <span className="text-[10px] text-industrial-dim">
+            Целевой видео-битрейт в kbps. По умолчанию: CBR 6000.
+          </span>
+        </label>
         <label className="flex flex-col gap-1 md:col-span-2">
           <span className="text-industrial-muted">Доп. аргументы ffmpeg (вставляются перед -f flv)</span>
           <input

@@ -1,7 +1,6 @@
 import {
   AlertCircle,
   AlertTriangle,
-  BadgeCheck,
   ArrowLeftRight,
   Check,
   CheckCircle2,
@@ -25,6 +24,7 @@ import {
 } from '../lib/timezones'
 import { collectFuturePublishCandidates } from '@services/schedule/publishSchedule'
 import { ProxyStatusGlyph } from '../lib/proxyCheckDisplay'
+import adsLogo from '../../../ads_logo.jpg'
 
 type ChannelRow = Awaited<ReturnType<typeof window.electronAPI.db.listChannels>>[number]
 type ProxyRow = Awaited<ReturnType<typeof window.electronAPI.db.listProxies>>[number]
@@ -35,6 +35,7 @@ type BeginManualInAdsResult = Awaited<ReturnType<typeof window.electronAPI.db.oa
 type SyncProxyFromAdsResult = Awaited<ReturnType<typeof window.electronAPI.db.syncProxyFromAds>>
 type WaitManualResult = Awaited<ReturnType<typeof window.electronAPI.db.oauthWaitManual>>
 type FinishManualResult = Awaited<ReturnType<typeof window.electronAPI.db.oauthFinishManual>>
+type OAuthCheckResult = Awaited<ReturnType<typeof window.electronAPI.db.oauthCheck>>
 type GenerateMetaResult = Awaited<ReturnType<typeof window.electronAPI.ai.generateChannelMeta>>
 type UploadResult = Awaited<ReturnType<typeof window.electronAPI.db.uploadTestVideo>>
 type UpdatePublishingResult = Awaited<ReturnType<typeof window.electronAPI.db.updateChannelPublishing>>
@@ -62,6 +63,19 @@ function formatDateTime(value: string | null): string {
     hour: '2-digit',
     minute: '2-digit'
   })
+}
+
+function formatLastVideoDate(value: string | null): string {
+  if (!value) return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return value
+  const datePart = d.toLocaleDateString('ru-RU', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric'
+  })
+  const timePart = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+  return `${datePart}г. в ${timePart}`
 }
 
 function toDateTimeLocalValue(value: string | null): string {
@@ -340,7 +354,10 @@ export function ChannelsPage(): JSX.Element {
     try {
       const res: BeginManualInAdsResult = await window.electronAPI.db.oauthBeginManualInAds({ channelId })
       if (!res.ok) {
-        setRowActionMsg(`Ошибка запуска OAuth в ADS: ${res.error}`)
+        const normalizedError = /fetch failed/i.test(res.error)
+          ? 'Ошибка запуска OAuth: Не запущен ADS Power'
+          : `Ошибка запуска OAuth в ADS: ${res.error}`
+        setRowActionMsg(normalizedError)
         return
       }
       setManualAuthUrlCopied(false)
@@ -418,6 +435,18 @@ export function ChannelsPage(): JSX.Element {
       setRowActionMsg(
         `Загрузка завершена: успешно ${res.data.uploaded}, ошибок ${res.data.failed}, сегодня ${res.data.daily_used}/${res.data.daily_limit}`
       )
+      await reload()
+    } finally {
+      setBusyRow(null)
+    }
+  }
+
+  async function checkOAuth(channelId: number): Promise<void> {
+    if (busyRow !== null) return
+    setRowActionMsg(null)
+    setBusyRow(channelId)
+    try {
+      await window.electronAPI.db.oauthCheck({ channelId })
       await reload()
     } finally {
       setBusyRow(null)
@@ -838,7 +867,14 @@ export function ChannelsPage(): JSX.Element {
                       </span>
                     </td>
                     <td className="px-2 py-2 text-industrial-dim">
-                      {ch.oauth_profile_label ?? (ch.oauth_profile_id != null ? `#${ch.oauth_profile_id}` : '—')}
+                      <span className="inline-flex items-center gap-1.5">
+                        {ch.oauth_status === 'ok' ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" strokeWidth={1.8} aria-hidden />
+                        ) : ch.oauth_status === 'invalid' ? (
+                          <AlertTriangle className="h-3.5 w-3.5 text-red-400" strokeWidth={1.8} aria-hidden />
+                        ) : null}
+                        <span>{ch.oauth_profile_label ?? (ch.oauth_profile_id != null ? `#${ch.oauth_profile_id}` : '—')}</span>
+                      </span>
                     </td>
                     <td className="px-2 py-2 font-mono text-industrial-muted">
                       <span className="inline-flex flex-wrap items-center gap-2">
@@ -885,56 +921,65 @@ export function ChannelsPage(): JSX.Element {
                     >
                       <span className="inline-flex items-center gap-1.5">
                         <QueueBufferGlyph tier={queueBufferTier(ch.last_queue_activity_at, ch.schedule_timezone)} />
-                        {formatDateTime(ch.last_queue_activity_at ?? null)}
+                        {formatLastVideoDate(ch.last_queue_activity_at ?? null)}
                       </span>
                     </td>
                     <td className="px-2 py-2">
-                      <div className="flex flex-wrap gap-1">
-                        <button
-                          type="button"
-                          disabled={busyRow === ch.id || !(ch.ads_profile_id && ch.ads_profile_id.trim())}
-                          onClick={() => void beginManualConnectInAds(ch.id)}
-                          className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-emerald-300 hover:border-industrial-muted disabled:opacity-40"
-                          title="Открыть OAuth сразу в ADS"
-                        >
-                          <BadgeCheck className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busyRow === ch.id}
-                          onClick={() => openEditor(ch)}
-                          className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
-                          title="Редактировать параметры публикации"
-                        >
-                          <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busyRow === ch.id}
-                          onClick={() => void beginManualConnect(ch.id)}
-                          className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
-                          title={ch.youtube_channel_id ? 'Переподключить YouTube (ссылка)' : 'Подключить YouTube (ссылка)'}
-                        >
-                          <Link2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busyRow === ch.id}
-                          onClick={() => void uploadTest(ch.id)}
-                          className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
-                          title="Загрузить видео"
-                        >
-                          <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busyRow === ch.id}
-                          onClick={() => void removeChannel(ch.id)}
-                          className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-red-300 hover:border-red-400 disabled:opacity-40"
-                          title="Удалить канал"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </button>
+                      <div className="grid gap-1">
+                        <div className="flex flex-wrap gap-1">
+                          <button
+                            type="button"
+                            disabled={busyRow === ch.id}
+                            onClick={() => void uploadTest(ch.id)}
+                            className="inline-flex items-center gap-1 border border-emerald-500/60 bg-emerald-600/20 px-2 py-1 text-[11px] text-emerald-300 hover:border-emerald-400 hover:bg-emerald-600/30 disabled:opacity-40"
+                            title="Загрузить видео"
+                          >
+                            <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />
+                            <span>Загрузить видео</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busyRow === ch.id}
+                            onClick={() => openEditor(ch)}
+                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+                            title="Редактировать параметры публикации"
+                          >
+                            <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          <button
+                            type="button"
+                            disabled={busyRow === ch.id || !(ch.ads_profile_id && ch.ads_profile_id.trim())}
+                            onClick={() => void beginManualConnectInAds(ch.id)}
+                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-emerald-300 hover:border-industrial-muted disabled:opacity-40"
+                            title="Открыть OAuth сразу в ADS"
+                          >
+                            <img
+                              src={adsLogo}
+                              alt="ADS"
+                              className="h-3.5 w-3.5 rounded-[2px] object-cover"
+                            />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busyRow === ch.id}
+                            onClick={() => void checkOAuth(ch.id)}
+                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+                            title="Проверить OAuth токен канала"
+                          >
+                            <CheckCircle2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busyRow === ch.id}
+                            onClick={() => void removeChannel(ch.id)}
+                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-red-300 hover:border-red-400 disabled:opacity-40"
+                            title="Удалить канал"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          </button>
+                        </div>
                       </div>
                     </td>
                   </tr>
@@ -1316,6 +1361,18 @@ export function ChannelsPage(): JSX.Element {
 
               <div className="shrink-0 border-t border-industrial-border bg-industrial-panel px-4 py-3">
                 <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (editingChannelId) void beginManualConnect(editingChannelId)
+                    }}
+                    disabled={busyRow !== null || !editingChannelId}
+                    className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-3 py-2 text-sm text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+                    title="Техническая кнопка на случай проблем с ADS: открыть OAuth ссылкой"
+                  >
+                    <Link2 className="h-4 w-4" strokeWidth={1.5} />
+                    Переподключить YouTube (ссылка)
+                  </button>
                   <button
                     type="button"
                     onClick={() => void saveEditor()}

@@ -233,3 +233,50 @@ export function migrateToV11IfNeeded(db: Database.Database): void {
     db.exec(`ALTER TABLE channels ADD COLUMN ads_profile_name TEXT`)
   }
 }
+
+/** Миграция v12: управляемый видео-битрейт и режим CBR/VBR для стримеров. */
+export function migrateToV12IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'video_bitrate_kbps')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN video_bitrate_kbps INTEGER NOT NULL DEFAULT 6000`)
+  }
+  if (!cols.some((c) => c.name === 'video_bitrate_mode')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN video_bitrate_mode TEXT NOT NULL DEFAULT 'cbr'`)
+  }
+  db.exec(`UPDATE streamers SET video_bitrate_mode = 'cbr' WHERE video_bitrate_mode NOT IN ('cbr', 'vbr') OR video_bitrate_mode IS NULL`)
+  db.exec(`UPDATE streamers SET video_bitrate_kbps = 6000 WHERE video_bitrate_kbps IS NULL OR video_bitrate_kbps < 200`)
+}
+
+/** Миграция v13: статус OAuth для явной индикации валидности авторизации. */
+export function migrateToV13IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'oauth_status')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN oauth_status TEXT NOT NULL DEFAULT 'unknown'`)
+  }
+  db.exec(`UPDATE channels SET oauth_status = 'unknown' WHERE oauth_status NOT IN ('unknown', 'ok', 'invalid') OR oauth_status IS NULL`)
+}
+
+/** Миграция v14: режим плейлиста стримера (random / ordered / single). */
+export function migrateToV14IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'stream_mode')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_mode TEXT NOT NULL DEFAULT 'random'`)
+  }
+  db.exec(`UPDATE streamers SET stream_mode = 'random' WHERE stream_mode NOT IN ('random', 'ordered', 'single') OR stream_mode IS NULL`)
+}
+
+/** Миграция v15: явный файл для режима single. */
+export function migrateToV15IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'single_segment_path')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN single_segment_path TEXT`)
+  }
+}
+
+/** Миграция v16: сохраненный пресет предпросмотра стрима на уровне канала. */
+export function migrateToV16IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'stream_preview_layout_json')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN stream_preview_layout_json TEXT`)
+  }
+}

@@ -8,6 +8,7 @@ import {
   Video
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import gzteamLogo from '../../gzteam_light.png'
 import { ChannelsPage } from './pages/ChannelsPage'
 import { LogsPage } from './pages/LogsPage'
 import { OverviewPage } from './pages/OverviewPage'
@@ -32,7 +33,7 @@ const nav: { id: NavId; label: string; icon: typeof LayoutDashboard; subtitle: s
     icon: Video,
     subtitle: 'RTMP, прокси, ffmpeg, Live API'
   },
-  { id: 'proxies', label: 'Прокси', icon: Server, subtitle: 'Только SOCKS5 · проверка IP и гео' },
+  { id: 'proxies', label: 'Прокси', icon: Server, subtitle: '' },
   { id: 'queue', label: 'Очередь', icon: ListVideo, subtitle: 'Загрузки и статусы' },
   { id: 'logs', label: 'Журнал', icon: ScrollText, subtitle: 'События и Telegram' },
   {
@@ -79,8 +80,13 @@ export function App(): JSX.Element {
     <div className="flex h-full min-h-0 border border-industrial-border bg-industrial-bg">
       <aside className="flex w-52 shrink-0 flex-col border-r border-industrial-border bg-industrial-panel">
         <div className="border-b border-industrial-border px-3 py-3">
-          <div className="text-xs uppercase tracking-wide text-industrial-muted">YouTube</div>
-          <div className="text-sm font-semibold text-industrial-text">Automation OS</div>
+          <div className="flex items-center gap-2">
+            <img src={gzteamLogo} alt="GZTeam" className="h-14 w-14 shrink-0 object-contain" />
+            <div>
+              <div className="text-xs uppercase tracking-wide text-industrial-muted">YouTube</div>
+              <div className="text-sm font-semibold text-industrial-text">Automation OS</div>
+            </div>
+          </div>
         </div>
         <nav className="flex flex-1 flex-col gap-0 p-2">
           {nav.map((item) => {

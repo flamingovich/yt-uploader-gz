@@ -31,6 +31,12 @@ export function updateProxyCheckStatus(id: number, statusJson: string): void {
     .run(statusJson, id)
 }
 
+export function updateProxyName(id: number, name: string | null): void {
+  getDb()
+    .prepare(`UPDATE proxies SET name = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(name?.trim() || null, id)
+}
+
 export function insertProxy(input: {
   name?: string | null
   host: string
@@ -51,6 +57,12 @@ export function insertProxy(input: {
       password: input.password ?? null
     })
   return { id: Number(r.lastInsertRowid) }
+}
+
+export function deleteProxy(id: number): { ok: true } | { ok: false; error: string } {
+  const r = getDb().prepare(`DELETE FROM proxies WHERE id = ?`).run(id)
+  if (r.changes < 1) return { ok: false, error: 'Прокси не найден' }
+  return { ok: true }
 }
 
 export type ChannelListItem = Omit<
@@ -78,7 +90,7 @@ export function listChannels(): ChannelListItem[] {
               c.default_description, c.default_tags, c.made_for_kids, c.default_category_id, c.default_language, c.publish_mode,
               c.schedule_start_at, c.schedule_videos_per_day, c.schedule_window_start_hour,
               c.schedule_window_end_hour, c.schedule_randomize_minutes, c.schedule_timezone,
-              c.source_folder_path, c.is_enabled, c.upload_cooldown_seconds, c.created_at, c.updated_at, p.label AS oauth_profile_label,
+              c.source_folder_path, c.is_enabled, c.upload_cooldown_seconds, c.oauth_status, c.stream_preview_layout_json, c.created_at, c.updated_at, p.label AS oauth_profile_label,
               (
                 SELECT q.completed_at
                 FROM upload_queue q
@@ -262,6 +274,7 @@ export function updateChannelOAuthData(input: {
   channel_title?: string | null
   oauth_access_token?: string | null
   oauth_refresh_token?: string | null
+  oauth_status?: 'unknown' | 'ok' | 'invalid'
   token_expires_at?: string | null
 }): void {
   getDb()
@@ -271,6 +284,7 @@ export function updateChannelOAuthData(input: {
            channel_title = COALESCE(@channel_title, channel_title),
            oauth_access_token = COALESCE(@oauth_access_token, oauth_access_token),
            oauth_refresh_token = COALESCE(@oauth_refresh_token, oauth_refresh_token),
+           oauth_status = COALESCE(@oauth_status, oauth_status),
            token_expires_at = COALESCE(@token_expires_at, token_expires_at),
            updated_at = datetime('now')
        WHERE id = @channel_id`
@@ -281,7 +295,22 @@ export function updateChannelOAuthData(input: {
       channel_title: input.channel_title ?? null,
       oauth_access_token: input.oauth_access_token ?? null,
       oauth_refresh_token: input.oauth_refresh_token ?? null,
+      oauth_status: input.oauth_status ?? null,
       token_expires_at: input.token_expires_at ?? null
+    })
+}
+
+export function updateChannelStreamPreviewLayout(channelId: number, layoutJson: string | null): void {
+  getDb()
+    .prepare(
+      `UPDATE channels
+       SET stream_preview_layout_json = @layout,
+           updated_at = datetime('now')
+       WHERE id = @channel_id`
+    )
+    .run({
+      channel_id: channelId,
+      layout: layoutJson
     })
 }
 

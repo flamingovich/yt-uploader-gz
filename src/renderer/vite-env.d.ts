@@ -28,6 +28,7 @@ type ChannelListItem = {
   last_queue_activity_at: string | null
   has_live_stream: number
   upload_cooldown_seconds: number
+  oauth_status: 'unknown' | 'ok' | 'invalid'
   source_folder_path: string | null
   is_enabled: number
   created_at: string
@@ -96,6 +97,16 @@ type Socks5CheckResult =
       city: string
       region: string
       isp?: string
+      upload_mbps_avg?: number
+      upload_test_sec?: number
+    }
+  | { ok: false; error: string }
+
+type Socks5UploadSpeedResult =
+  | {
+      ok: true
+      upload_mbps_avg: number
+      upload_test_sec: number
     }
   | { ok: false; error: string }
 
@@ -121,6 +132,13 @@ declare global {
           password?: string | null
           persistId?: number
         }): Promise<Socks5CheckResult>
+        speedTest(payload: {
+          host?: string
+          port?: number
+          login?: string | null
+          password?: string | null
+          persistId?: number
+        }): Promise<Socks5UploadSpeedResult>
       }
       settings: {
         get(): Promise<Record<string, string>>
@@ -145,6 +163,7 @@ declare global {
           login?: string | null
           password?: string | null
         }): Promise<CreateResult<{ id: number }>>
+        deleteProxy(id: number): Promise<CreateResult<{ id: number }>>
         createBulkProxies(payload: {
           lines: string
           defaultNamePrefix?: string
@@ -194,6 +213,10 @@ declare global {
           | CreateResult<{ flowId: string; authUrl: string }>
           | { ok: false; error: string }
         >
+        oauthCheck(payload: { channelId: number }): Promise<
+          | CreateResult<{ youtube_channel_id: string; channel_title: string }>
+          | { ok: false; error: string }
+        >
         syncProxyFromAds(payload: { channelId: number }): Promise<
           | CreateResult<{ mode: 'imported' | 'linked_existing' | 'no_proxy'; proxy_id: number | null; summary: string }>
           | { ok: false; error: string }
@@ -233,8 +256,12 @@ declare global {
           rtmp_stream_key?: string
           overlay_path?: string | null
           segments_folder_path?: string | null
+          stream_mode?: 'random' | 'ordered' | 'single'
+          single_segment_path?: string | null
           bumper_video_path?: string | null
           bumper_pad_target_sec?: number | null
+          video_bitrate_kbps?: number
+          video_bitrate_mode?: 'cbr' | 'vbr'
           ffmpeg_extra_args?: string | null
           youtube_broadcast_id?: string | null
           broadcast_title?: string | null
@@ -253,6 +280,17 @@ declare global {
       streamers: {
         start(payload: { streamerId: number }): Promise<CreateResult<Record<string, never>>>
         stop(payload: { streamerId: number }): Promise<CreateResult<{ streamerId: number }>>
+        openPreview(payload: {
+          channel_id?: number
+          stream_mode?: 'random' | 'ordered' | 'single'
+          segments_folder_path?: string | null
+          single_segment_path?: string | null
+          overlay_path?: string | null
+          bumper_video_path?: string | null
+          video_bitrate_kbps?: number
+          video_bitrate_mode?: 'cbr' | 'vbr'
+          ffmpeg_extra_args?: string | null
+        }): Promise<{ ok: true } | { ok: false; error: string }>
         applyBroadcastMeta(payload: {
           streamerId: number
           youtube_broadcast_id?: string | null
@@ -300,8 +338,12 @@ type StreamerDetailRow = {
   rtmp_stream_key: string
   overlay_path: string | null
   segments_folder_path: string | null
+  stream_mode: 'random' | 'ordered' | 'single'
+  single_segment_path: string | null
   bumper_video_path: string | null
   bumper_pad_target_sec: number | null
+  video_bitrate_kbps: number
+  video_bitrate_mode: 'cbr' | 'vbr'
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null
@@ -331,8 +373,12 @@ type StreamerListItem = {
   rtmp_ingest_url: string
   overlay_path: string | null
   segments_folder_path: string | null
+  stream_mode: 'random' | 'ordered' | 'single'
+  single_segment_path: string | null
   bumper_video_path: string | null
   bumper_pad_target_sec: number | null
+  video_bitrate_kbps: number
+  video_bitrate_mode: 'cbr' | 'vbr'
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null

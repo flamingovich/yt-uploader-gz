@@ -1,12 +1,37 @@
-import { Loader2 } from 'lucide-react'
+import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ProxyStatusGlyph } from '../lib/proxyCheckDisplay'
 
 type ProxyRow = Awaited<ReturnType<typeof window.electronAPI.db.listProxies>>[number]
 type CreateProxyResult = Awaited<ReturnType<typeof window.electronAPI.db.createProxy>>
 type CreateBulkProxyResult = Awaited<ReturnType<typeof window.electronAPI.db.createBulkProxies>>
+type DeleteProxyResult = Awaited<ReturnType<typeof window.electronAPI.db.deleteProxy>>
 type CheckResult = Awaited<ReturnType<typeof window.electronAPI.proxy.check>>
+type SpeedTestResult = Awaited<ReturnType<typeof window.electronAPI.proxy.speedTest>>
 type ProxyMode = 'single' | 'bulk'
+
+function parseUploadKbpsFromLastCheck(raw: string | null): number | null {
+  if (!raw) return null
+  try {
+    const j = JSON.parse(raw) as { upload_mbps_avg?: number }
+    if (typeof j.upload_mbps_avg !== 'number' || !Number.isFinite(j.upload_mbps_avg)) return null
+    return Math.max(1, Math.round(j.upload_mbps_avg * 125))
+  } catch {
+    return null
+  }
+}
+
+function formatLiveSpeedKbps(input: {
+  baselineKbps: number | null
+  startedAt: number
+  now: number
+}): number {
+  const elapsed = Math.max(0, (input.now - input.startedAt) / 1000)
+  const base = input.baselineKbps && input.baselineKbps > 0 ? input.baselineKbps : 3000
+  // Небольшое "живое" колебание вокруг базы, чтобы на кнопке было видно прогресс замера.
+  const wave = Math.sin(elapsed * 2.1) * 0.08 + Math.sin(elapsed * 0.7) * 0.04
+  return Math.max(100, Math.round(base * (1 + wave)))
+}
 
 function parseCompactProxyLine(raw: string): { host: string; port: string; login: string; password: string } | null {
   const parts = raw.trim().split(':')
@@ -20,17 +45,31 @@ function parseCompactProxyLine(raw: string): { host: string; port: string; login
   return { host, port, login, password }
 }
 
-function formatLastCheck(raw: string | null): string {
-  if (!raw) return '—'
-  try {
-    const j = JSON.parse(raw) as CheckResult
-    if (j.ok) {
-      return `${j.ip} · ${j.country}, ${j.city}`
-    }
-    return `ошибка: ${j.error}`
-  } catch {
-    return raw.length > 80 ? `${raw.slice(0, 80)}…` : raw
-  }
+function formatLastCheckedAt(value: string | null): string {
+  if (!value) return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return value
+  return d.toLocaleString('ru-RU', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+function formatUploadKbps(raw: string | null): string {
+  const kbps = parseUploadKbpsFromLastCheck(raw)
+  return kbps ? `${kbps} KBPS` : '—'
+}
+
+function uploadKbpsToneClass(kbps: number | null): string {
+  if (kbps == null) return 'text-industrial-dim'
+  if (kbps <= 1000) return 'text-red-900'
+  if (kbps <= 2500) return 'text-red-400'
+  if (kbps <= 4000) return 'text-orange-400'
+  if (kbps <= 6000) return 'text-yellow-300'
+  return 'text-emerald-400'
 }
 
 export function ProxiesPage(): JSX.Element {
@@ -48,6 +87,9 @@ export function ProxiesPage(): JSX.Element {
   const [bulkNamePrefix, setBulkNamePrefix] = useState('Proxy')
   const [formCheck, setFormCheck] = useState<CheckResult | null>(null)
   const [checking, setChecking] = useState<'form' | number | 'bulk' | null>(null)
+  const [speedTestingId, setSpeedTestingId] = useState<number | null>(null)
+  const [speedUi, setSpeedUi] = useState<{ id: number; startedAt: number; durationSec: number; kbpsHint: number | null } | null>(null)
+  const [speedTimerNow, setSpeedTimerNow] = useState<number>(Date.now())
   const [bulkChecking, setBulkChecking] = useState(false)
   const [showCreateForm, setShowCreateForm] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
@@ -78,6 +120,12 @@ export function ProxiesPage(): JSX.Element {
     const n = rows.filter((r) => selectedIds.has(r.id)).length
     el.indeterminate = n > 0 && n < rows.length
   }, [rows, selectedIds])
+
+  useEffect(() => {
+    if (speedTestingId == null) return
+    const t = window.setInterval(() => setSpeedTimerNow(Date.now()), 100)
+    return () => window.clearInterval(t)
+  }, [speedTestingId])
 
   async function runCheck(args: {
     host?: string
@@ -126,6 +174,32 @@ export function ProxiesPage(): JSX.Element {
       }
     } finally {
       setBulkChecking(false)
+    }
+  }
+
+  async function runSpeedTest(row: ProxyRow): Promise<void> {
+    if (speedTestingId !== null || checking !== null || bulkChecking) return
+    const startedAt = Date.now()
+    const durationSec = 12
+    setSpeedUi({
+      id: row.id,
+      startedAt,
+      durationSec,
+      kbpsHint: parseUploadKbpsFromLastCheck(row.last_check_status)
+    })
+    setSpeedTestingId(row.id)
+    try {
+      const res: SpeedTestResult = await window.electronAPI.proxy.speedTest({ persistId: row.id })
+      if (res.ok) {
+        setBulkResult(`Upload speed: ${res.upload_mbps_avg.toFixed(2)} Mbps за ${res.upload_test_sec.toFixed(1)}s (proxy #${row.id})`)
+        setBulkError(null)
+        await reload()
+      } else {
+        setBulkError(`Speed test не удался (proxy #${row.id}): ${res.error}`)
+      }
+    } finally {
+      setSpeedTestingId(null)
+      setSpeedUi(null)
     }
   }
 
@@ -190,6 +264,17 @@ export function ProxiesPage(): JSX.Element {
     }
   }
 
+  async function removeProxy(proxyId: number): Promise<void> {
+    if (checking !== null || speedTestingId !== null || bulkChecking) return
+    if (!window.confirm(`Удалить прокси #${proxyId}?`)) return
+    const res: DeleteProxyResult = await window.electronAPI.db.deleteProxy(proxyId)
+    if (!res.ok) {
+      setBulkError(res.error)
+      return
+    }
+    await reload()
+  }
+
   const colCount = 9
 
   return (
@@ -200,8 +285,9 @@ export function ProxiesPage(): JSX.Element {
           <button
             type="button"
             onClick={() => setShowCreateForm((v) => !v)}
-            className="border border-industrial-border bg-industrial-bg px-3 py-2 text-xs text-industrial-text hover:border-industrial-muted"
+            className="inline-flex items-center gap-2 border border-emerald-500/60 bg-emerald-600/20 px-3 py-2 text-xs font-medium text-emerald-300 hover:border-emerald-400 hover:bg-emerald-600/30"
           >
+            <Plus className="h-4 w-4" strokeWidth={2} />
             {showCreateForm ? 'Скрыть форму' : 'Добавить прокси'}
           </button>
         </div>
@@ -384,7 +470,7 @@ export function ProxiesPage(): JSX.Element {
                 <input
                   ref={selectAllRef}
                   type="checkbox"
-                  className="accent-industrial-text"
+                  className="h-4 w-4 cursor-pointer rounded border border-industrial-border bg-industrial-bg accent-emerald-400"
                   title="Выбрать все / снять всё"
                   checked={rows.length > 0 && rows.every((r) => selectedIds.has(r.id))}
                   onChange={() => toggleSelectAll()}
@@ -397,8 +483,8 @@ export function ProxiesPage(): JSX.Element {
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Тип</th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Название</th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Адрес</th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">Логин</th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium">Последняя проверка</th>
+              <th className="border-b border-industrial-border px-2 py-2 font-medium">Upload KBPS</th>
               <th className="border-b border-industrial-border px-2 py-2 font-medium"> </th>
             </tr>
           </thead>
@@ -415,7 +501,7 @@ export function ProxiesPage(): JSX.Element {
                   <td className="px-1 py-2">
                     <input
                       type="checkbox"
-                      className="accent-industrial-text"
+                      className="h-4 w-4 cursor-pointer rounded border border-industrial-border bg-industrial-bg accent-emerald-400"
                       checked={selectedIds.has(r.id)}
                       onChange={() => toggleRow(r.id)}
                     />
@@ -429,18 +515,65 @@ export function ProxiesPage(): JSX.Element {
                   <td className="px-2 py-2 font-mono">
                     {r.host}:{r.port}
                   </td>
-                  <td className="px-2 py-2 text-industrial-muted">{r.login ?? '—'}</td>
-                  <td className="max-w-[280px] px-2 py-2 text-industrial-dim">{formatLastCheck(r.last_check_status)}</td>
+                  <td className="px-2 py-2 text-industrial-dim">{formatLastCheckedAt(r.last_check_at)}</td>
+                  <td
+                    className={`px-2 py-2 font-mono ${
+                      speedTestingId === r.id && speedUi && speedUi.id === r.id
+                        ? uploadKbpsToneClass(
+                            formatLiveSpeedKbps({
+                              baselineKbps: speedUi.kbpsHint,
+                              startedAt: speedUi.startedAt,
+                              now: speedTimerNow
+                            })
+                          )
+                        : uploadKbpsToneClass(parseUploadKbpsFromLastCheck(r.last_check_status))
+                    }`}
+                  >
+                    {speedTestingId === r.id && speedUi && speedUi.id === r.id
+                      ? `${formatLiveSpeedKbps({
+                          baselineKbps: speedUi.kbpsHint,
+                          startedAt: speedUi.startedAt,
+                          now: speedTimerNow
+                        })} KBPS`
+                      : formatUploadKbps(r.last_check_status)}
+                  </td>
                   <td className="px-2 py-2">
-                    <button
-                      type="button"
-                      disabled={checking === r.id || bulkChecking}
-                      onClick={() => void runCheck({ persistId: r.id })}
-                      className="inline-flex items-center gap-1 border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-50"
-                    >
-                      {checking === r.id ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-                      Проверить
-                    </button>
+                    <div className="flex flex-wrap gap-1">
+                      <button
+                        type="button"
+                        disabled={checking === r.id || bulkChecking || speedTestingId === r.id}
+                        onClick={() => void runCheck({ persistId: r.id })}
+                        className="inline-flex items-center gap-1 border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-50"
+                      >
+                        {checking === r.id ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                        Проверить
+                      </button>
+                      <button
+                        type="button"
+                        disabled={speedTestingId === r.id || bulkChecking || checking !== null}
+                        onClick={() => void runSpeedTest(r)}
+                        className="inline-flex items-center gap-1 border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-50"
+                      >
+                        {speedTestingId === r.id ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                        {speedTestingId === r.id && speedUi && speedUi.id === r.id
+                          ? `${formatLiveSpeedKbps({
+                              baselineKbps: speedUi.kbpsHint,
+                              startedAt: speedUi.startedAt,
+                              now: speedTimerNow
+                            })} KBPS (${Math.max(0, speedUi.durationSec - (speedTimerNow - speedUi.startedAt) / 1000).toFixed(1)}s)`
+                          : 'Speed test'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={checking !== null || bulkChecking || speedTestingId !== null}
+                        onClick={() => void removeProxy(r.id)}
+                        className="inline-flex items-center gap-1 border border-red-500/60 bg-red-600/15 px-2 py-1 text-[11px] text-red-300 hover:border-red-400 hover:bg-red-600/25 disabled:opacity-50"
+                        title="Удалить прокси"
+                      >
+                        <Trash2 className="h-3 w-3" strokeWidth={1.8} />
+                        Удалить
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))

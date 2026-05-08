@@ -22,6 +22,14 @@ const api = {
       password?: string | null
       persistId?: number
     }) => ipcRenderer.invoke('proxy:check', payload)
+    ,
+    speedTest: (payload: {
+      host?: string
+      port?: number
+      login?: string | null
+      password?: string | null
+      persistId?: number
+    }) => ipcRenderer.invoke('proxy:speedTest', payload)
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
@@ -43,6 +51,7 @@ const api = {
       login?: string | null
       password?: string | null
     }) => ipcRenderer.invoke('db:proxies:create', payload),
+    deleteProxy: (id: number) => ipcRenderer.invoke('db:proxies:delete', id),
     createBulkProxies: (payload: { lines: string; defaultNamePrefix?: string }) =>
       ipcRenderer.invoke('db:proxies:createBulk', payload),
     createChannel: (payload: {
@@ -75,6 +84,7 @@ const api = {
     oauthBeginManual: (payload: { channelId: number }) => ipcRenderer.invoke('channels:oauthBeginManual', payload),
     oauthBeginManualInAds: (payload: { channelId: number }) =>
       ipcRenderer.invoke('channels:oauthBeginManualInAds', payload),
+    oauthCheck: (payload: { channelId: number }) => ipcRenderer.invoke('channels:oauthCheck', payload),
     syncProxyFromAds: (payload: { channelId: number }) => ipcRenderer.invoke('channels:syncProxyFromAds', payload),
     oauthWaitManual: (payload: { flowId: string; timeoutMs?: number }) => ipcRenderer.invoke('channels:oauthWaitManual', payload),
     oauthFinishManual: (payload: { flowId: string; callbackUrl: string }) =>
@@ -93,8 +103,12 @@ const api = {
       rtmp_stream_key?: string
       overlay_path?: string | null
       segments_folder_path?: string | null
+      stream_mode?: 'random' | 'ordered' | 'single'
+      single_segment_path?: string | null
       bumper_video_path?: string | null
       bumper_pad_target_sec?: number | null
+      video_bitrate_kbps?: number
+      video_bitrate_mode?: 'cbr' | 'vbr'
       ffmpeg_extra_args?: string | null
       youtube_broadcast_id?: string | null
       broadcast_title?: string | null
@@ -113,6 +127,17 @@ const api = {
   streamers: {
     start: (payload: { streamerId: number }) => ipcRenderer.invoke('streamers:start', payload),
     stop: (payload: { streamerId: number }) => ipcRenderer.invoke('streamers:stop', payload),
+    openPreview: (payload: {
+      channel_id?: number
+      stream_mode?: 'random' | 'ordered' | 'single'
+      segments_folder_path?: string | null
+      single_segment_path?: string | null
+      overlay_path?: string | null
+      bumper_video_path?: string | null
+      video_bitrate_kbps?: number
+      video_bitrate_mode?: 'cbr' | 'vbr'
+      ffmpeg_extra_args?: string | null
+    }) => ipcRenderer.invoke('streamers:openPreview', payload),
     applyBroadcastMeta: (payload: {
       streamerId: number
       youtube_broadcast_id?: string | null

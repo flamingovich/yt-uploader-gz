@@ -57,6 +57,9 @@ export interface ChannelRow {
   schedule_timezone: string
   oauth_refresh_token: string | null
   oauth_access_token: string | null
+  oauth_status: 'unknown' | 'ok' | 'invalid'
+  /** Сохраненный пресет предпросмотра стрима (JSON). */
+  stream_preview_layout_json: string | null
   token_expires_at: string | null
   source_folder_path: string | null
   is_enabled: number
@@ -109,9 +112,17 @@ export interface StreamerRow {
   rtmp_stream_key: string
   overlay_path: string | null
   segments_folder_path: string | null
+  /** Режим плейлиста стрима: random = shuffle, ordered = по порядку, single = один кусок. */
+  stream_mode: 'random' | 'ordered' | 'single'
+  /** Явно выбранный файл для режима single. */
+  single_segment_path: string | null
   bumper_video_path: string | null
   /** NULL = авто; 0 = один проигрыв; >0 = зациклить до N сек. */
   bumper_pad_target_sec: number | null
+  /** Целевой видео-битрейт (kbps). */
+  video_bitrate_kbps: number
+  /** Режим контроля битрейта видеокодека. */
+  video_bitrate_mode: 'cbr' | 'vbr'
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null

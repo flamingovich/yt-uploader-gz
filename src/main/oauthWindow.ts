@@ -1,6 +1,7 @@
 import { BrowserWindow, session } from 'electron'
 import { randomUUID } from 'node:crypto'
 import type { ProxyRow } from '@services/db/types'
+import { resolveAppIconPath } from './appIcon'
 
 function toProxyRule(proxy?: ProxyRow | null): string {
   if (!proxy) return ''
@@ -24,6 +25,7 @@ export async function openOAuthInAppWindow(input: {
   url: string
   proxy?: ProxyRow | null
 }): Promise<{ close: () => void }> {
+  const icon = resolveAppIconPath()
   const partition = `oauth-${randomUUID()}`
   const ses = session.fromPartition(partition, { cache: false })
 
@@ -42,6 +44,7 @@ export async function openOAuthInAppWindow(input: {
     backgroundColor: '#0f0f0f',
     show: false,
     autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       partition,
       nodeIntegration: false,

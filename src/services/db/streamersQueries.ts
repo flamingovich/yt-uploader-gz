@@ -11,7 +11,7 @@ export function listStreamers(): StreamerListItem[] {
   return getDb()
     .prepare(
       `SELECT s.id, s.name, s.channel_id, s.proxy_id, s.rtmp_ingest_url,
-              s.overlay_path, s.segments_folder_path, s.bumper_video_path, s.bumper_pad_target_sec, s.ffmpeg_extra_args,
+              s.overlay_path, s.segments_folder_path, s.stream_mode, s.single_segment_path, s.bumper_video_path, s.bumper_pad_target_sec, s.video_bitrate_kbps, s.video_bitrate_mode, s.ffmpeg_extra_args,
               s.minecraft_prewarm_enabled, s.minecraft_prewarm_chunks_folder, s.minecraft_prewarm_audio_folder, s.minecraft_prewarm_music_path,
               s.youtube_broadcast_id, s.broadcast_title, s.broadcast_description, s.broadcast_tags,
               s.broadcast_privacy, s.broadcast_category_id, s.broadcast_thumb_path,
@@ -68,8 +68,12 @@ export function updateStreamer(
     rtmp_stream_key: string
     overlay_path: string | null
     segments_folder_path: string | null
+    stream_mode: 'random' | 'ordered' | 'single'
+    single_segment_path: string | null
     bumper_video_path: string | null
     bumper_pad_target_sec: number | null
+    video_bitrate_kbps: number
+    video_bitrate_mode: 'cbr' | 'vbr'
     ffmpeg_extra_args: string | null
     youtube_broadcast_id: string | null
     broadcast_title: string | null
@@ -93,8 +97,12 @@ export function updateStreamer(
     'rtmp_stream_key',
     'overlay_path',
     'segments_folder_path',
+    'stream_mode',
+    'single_segment_path',
     'bumper_video_path',
     'bumper_pad_target_sec',
+    'video_bitrate_kbps',
+    'video_bitrate_mode',
     'ffmpeg_extra_args',
     'youtube_broadcast_id',
     'broadcast_title',

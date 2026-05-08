@@ -11,6 +11,7 @@ import { getMediaDurationSeconds } from './ffprobe'
 const execFile = promisify(execFileCallback)
 
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm'])
+const NATURAL_COLLATOR = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' })
 
 /**
  * Артефакт Windows: `path.join('C:', 'D:\\a')` → `C:\\D\\a` → в UI `C:/D:/a`. Убираем ложный первый диск,
@@ -69,7 +70,7 @@ export async function collectSegmentVideos(dir: string): Promise<string[]> {
     if (!VIDEO_EXT.has(ext)) continue
     out.push(resolve(root, e.name))
   }
-  return out.sort((a, b) => a.localeCompare(b))
+  return out.sort((a, b) => NATURAL_COLLATOR.compare(a, b))
 }
 
 export async function writeConcatListFile(input: {
@@ -128,6 +129,43 @@ export async function writeConcatListFileMultiShuffledPasses(input: {
   }
   const body = `${lines.join('\n')}\n`
   const name = `ytu-concat-multi-${randomBytes(8).toString('hex')}.txt`
+  const path = join(tmpdir(), name)
+  await fsp.writeFile(path, body, 'utf8')
+  return path
+}
+
+export async function writeConcatListFileMultiOrderedPasses(input: {
+  segmentPaths: string[]
+}): Promise<string> {
+  const n = input.segmentPaths.length
+  if (n < 1) throw new Error('Нет сегментов')
+  const passes = streamerMultiPassCount(n)
+  const ordered = [...input.segmentPaths]
+  const lines: string[] = []
+  for (let c = 0; c < passes; c += 1) {
+    for (const p of ordered) {
+      lines.push(`file '${concatFileDirectiveValue(p)}'`)
+    }
+  }
+  const body = `${lines.join('\n')}\n`
+  const name = `ytu-concat-ordered-${randomBytes(8).toString('hex')}.txt`
+  const path = join(tmpdir(), name)
+  await fsp.writeFile(path, body, 'utf8')
+  return path
+}
+
+export async function writeSingleSegmentConcatListMultiPasses(input: {
+  segmentPath: string
+}): Promise<string> {
+  const one = resolve(normalizeFsPath(input.segmentPath))
+  await fsp.access(one)
+  const passes = streamerMultiPassCount(1)
+  const lines: string[] = []
+  for (let i = 0; i < passes; i += 1) {
+    lines.push(`file '${concatFileDirectiveValue(one)}'`)
+  }
+  const body = `${lines.join('\n')}\n`
+  const name = `ytu-concat-single-${randomBytes(8).toString('hex')}.txt`
   const path = join(tmpdir(), name)
   await fsp.writeFile(path, body, 'utf8')
   return path

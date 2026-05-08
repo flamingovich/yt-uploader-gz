@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { readFileSync, unlinkSync } from 'node:fs'
+import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { getChannelById, getProxyById } from '@services/db/queries'
@@ -18,7 +19,9 @@ import {
   collectSegmentVideos,
   streamerMultiPassCount,
   unlinkQuiet,
+  writeConcatListFileMultiOrderedPasses,
   writeConcatListFileMultiShuffledPasses,
+  writeSingleSegmentConcatListMultiPasses,
   writeMinecraftSfxConcatListMultiPasses,
   writeMusicRepeatConcatList
 } from '@services/stream/streamerConcat'
@@ -40,6 +43,10 @@ import type { ProxyRow, StreamerRow } from '@services/db/types'
 
 function isMinecraftPrewarmOn(row: StreamerRow): boolean {
   return Number(row.minecraft_prewarm_enabled) === 1
+}
+
+function getStreamMode(row: StreamerRow): 'random' | 'ordered' | 'single' {
+  return row.stream_mode === 'ordered' || row.stream_mode === 'single' ? row.stream_mode : 'random'
 }
 
 type CreateOk = { ok: true }
@@ -308,6 +315,8 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
       const bumperArgs = buildFfmpegBumperDirectArgs({
         inputFile: bumperFs,
         outputRtmpUrl,
+        videoBitrateKbps: first.video_bitrate_kbps,
+        videoBitrateMode: first.video_bitrate_mode,
         extraArgs: first.ffmpeg_extra_args,
         padDurationSecIfShorter: padShort
       })
@@ -329,8 +338,15 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
     const row = getStreamerById(streamerId)
     if (!row) break
     const mc = isMinecraftPrewarmOn(row)
+    const streamMode = getStreamMode(row)
     const dir = mc ? row.minecraft_prewarm_chunks_folder?.trim() : row.segments_folder_path?.trim()
-    if (!dir) {
+    if (!mc && streamMode === 'single') {
+      const one = row.single_segment_path?.trim()
+      if (!one) {
+        updateStreamerProcessState(streamerId, 'error', 'Для режима «Один кусок» выберите mp4 файл')
+        return
+      }
+    } else if (!dir) {
       updateStreamerProcessState(
         streamerId,
         'error',
@@ -338,7 +354,10 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
       )
       return
     }
-    const segs = await collectSegmentVideos(dir)
+    const segs =
+      !mc && streamMode === 'single'
+        ? [row.single_segment_path!.trim()]
+        : await collectSegmentVideos(dir!)
     if (segs.length === 0) {
       updateStreamerProcessState(streamerId, 'error', 'В папке кусков нет поддерживаемых видео (.mp4, .mov, …)')
       return
@@ -347,9 +366,13 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
     let sfxListPath: string | null = null
     let musicListPath: string | null = null
     try {
-      listPath = await writeConcatListFileMultiShuffledPasses({
-        segmentPaths: segs
-      })
+      if (streamMode === 'ordered') {
+        listPath = await writeConcatListFileMultiOrderedPasses({ segmentPaths: segs })
+      } else if (streamMode === 'single') {
+        listPath = await writeSingleSegmentConcatListMultiPasses({ segmentPath: segs[0]! })
+      } else {
+        listPath = await writeConcatListFileMultiShuffledPasses({ segmentPaths: segs })
+      }
     } catch (e) {
       updateStreamerProcessState(
         streamerId,
@@ -409,14 +432,20 @@ async function runStreamerLoop(streamerId: number, session: Session): Promise<vo
         sfxConcatListPath: sfxListPath!,
         musicConcatListPath: musicListPath!,
         outputRtmpUrl,
+        videoBitrateKbps: row.video_bitrate_kbps,
+        videoBitrateMode: row.video_bitrate_mode,
         extraArgs: row.ffmpeg_extra_args
       })
     } else {
+      const chLayout = getChannelById(row.channel_id)
       args = buildFfmpegStreamArgs({
         concatListPath: listPath!,
         outputRtmpUrl: outputRtmpUrl,
         overlayPath: row.overlay_path,
-        extraArgs: row.ffmpeg_extra_args
+        videoBitrateKbps: row.video_bitrate_kbps,
+        videoBitrateMode: row.video_bitrate_mode,
+        extraArgs: row.ffmpeg_extra_args,
+        streamPreviewLayoutJson: chLayout?.stream_preview_layout_json ?? null
       })
     }
 
@@ -465,15 +494,28 @@ export async function startStreamer(streamerId: number): Promise<CreateResult> {
     return { ok: false, error: 'У канала нет OAuth refresh token — подключите YouTube в разделе «Каналы»' }
   }
   const mc = isMinecraftPrewarmOn(row)
+  const streamMode = getStreamMode(row)
   const dir = mc ? row.minecraft_prewarm_chunks_folder?.trim() : row.segments_folder_path?.trim()
-  if (!dir) {
+  if (!mc && streamMode === 'single') {
+    const one = row.single_segment_path?.trim()
+    if (!one) {
+      return { ok: false, error: 'Для режима «Один кусок» выберите mp4 файл' }
+    }
+    try {
+      await fsp.access(one)
+    } catch {
+      return { ok: false, error: 'Файл для режима «Один кусок» не найден' }
+    }
+  } else if (!dir) {
     return {
       ok: false,
       error: mc ? 'Укажите папку с кусками для «Майнкрафт прогрев»' : 'Укажите папку с видео-кусками'
     }
   }
-  const segs = await collectSegmentVideos(dir)
-  if (segs.length === 0) return { ok: false, error: 'В папке кусков нет видеофайлов' }
+  if (!mc && streamMode !== 'single') {
+    const segs = await collectSegmentVideos(dir!)
+    if (segs.length === 0) return { ok: false, error: 'В папке кусков нет видеофайлов' }
+  }
   if (mc) {
     const ad = row.minecraft_prewarm_audio_folder?.trim()
     const mus = row.minecraft_prewarm_music_path?.trim()

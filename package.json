@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
+    "font-list": "^2.0.2",
     "googleapis": "^171.4.0",
     "lucide-react": "^0.468.0",
     "playwright-core": "^1.59.1",

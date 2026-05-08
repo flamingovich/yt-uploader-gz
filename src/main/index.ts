@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { initDatabase, closeDatabase } from '@services/db/init'
 import { registerIpcHandlers } from './ipc'
+import { resolveAppIconPath } from './appIcon'
 
 function resolvePreloadPath(): string {
   const dir = join(__dirname, '../preload')
@@ -20,6 +21,7 @@ function getDbPath(): string {
 }
 
 function createWindow(): void {
+  const icon = resolveAppIconPath()
   mainWindow = new BrowserWindow({
     width: 1600,
     height: 800,
@@ -28,6 +30,7 @@ function createWindow(): void {
     backgroundColor: '#0f0f0f',
     show: false,
     autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: resolvePreloadPath(),
       contextIsolation: true,
