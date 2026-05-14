@@ -40,6 +40,12 @@ type AdsPowerResponse<T> = {
   data?: T
 }
 
+type AdsPowerActiveData = {
+  ws?: AdsPowerWs
+  debug_port?: string
+  webdriver?: string
+}
+
 function normalizeBaseUrl(input: string): string {
   const raw = input.trim() || 'http://local.adspower.net:50325'
   return raw.endsWith('/') ? raw.slice(0, -1) : raw
@@ -151,6 +157,8 @@ export async function startAdsProfileAndOpenUrl(input: {
   apiKey: string
   profileId: string
   url: string
+  /** Открыть URL в новой вкладке (обычно справа / последней в ADS Chromium). */
+  openInNewTab?: boolean
 }): Promise<{ debugPort: string | null }> {
   const profileId = input.profileId.trim()
   if (!profileId) throw new Error('Не указан ADS profile id')
@@ -166,10 +174,27 @@ export async function startAdsProfileAndOpenUrl(input: {
       proxy_detection: '0'
     }
   })
-  if (started.code !== 0) {
+
+  const isAlreadyRunningError = /already|running|opened|launched|start.*fail/i.test(String(started.msg ?? ''))
+  let sessionData = started.data
+  if (started.code !== 0 && isAlreadyRunningError) {
+    // Profile may already be running: request active session and reuse its CDP endpoint.
+    const active = await callAdsPower<AdsPowerActiveData>({
+      baseUrl: input.baseUrl,
+      path: '/api/v2/browser-profile/active',
+      method: 'POST',
+      apiKey: input.apiKey,
+      body: { profile_id: profileId }
+    })
+    if (active.code !== 0) {
+      throw new Error(`ADS не вернул активную сессию профиля: ${active.msg ?? started.msg ?? 'unknown error'}`)
+    }
+    sessionData = active.data
+  } else if (started.code !== 0) {
     throw new Error(`ADS не запустил профиль: ${started.msg ?? 'unknown error'}`)
   }
-  const wsEndpoint = started.data?.ws?.puppeteer?.trim() ?? ''
+
+  const wsEndpoint = sessionData?.ws?.puppeteer?.trim() ?? ''
   if (!wsEndpoint) {
     throw new Error('ADS не вернул ws.puppeteer endpoint для профиля')
   }
@@ -178,13 +203,14 @@ export async function startAdsProfileAndOpenUrl(input: {
   try {
     const context = browser.contexts()[0]
     if (!context) throw new Error('Не удалось получить контекст браузера ADS')
-    const page = context.pages()[0] ?? (await context.newPage())
+    const page = input.openInNewTab ? await context.newPage() : context.pages()[0] ?? (await context.newPage())
+    await page.bringToFront().catch(() => {})
     await page.goto(input.url, { waitUntil: 'domcontentloaded' })
   } finally {
     await browser.close()
   }
 
   return {
-    debugPort: started.data?.debug_port ?? null
+    debugPort: sessionData?.debug_port ?? null
   }
 }

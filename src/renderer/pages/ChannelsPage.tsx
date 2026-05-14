@@ -1,20 +1,44 @@
 import {
   AlertCircle,
   AlertTriangle,
+  ArrowDownToLine,
   ArrowLeftRight,
+  Baby,
+  Calendar,
+  CalendarClock,
   Check,
   CheckCircle2,
+  Clapperboard,
+  Clock,
   Copy,
   ExternalLink,
+  FileText,
+  Film,
   FolderOpen,
+  Globe,
+  Hand,
+  Hash,
+  History,
+  KeyRound,
+  Languages,
+  Layers,
+  LayoutGrid,
   Link2,
+  ListVideo,
   Loader2,
+  Lock,
+  Network,
   Pencil,
   Plus,
-  RefreshCw,
+  Save,
+  Settings2,
   Sparkles,
+  Tags,
+  Timer,
   Trash2,
-  Upload
+  Tv,
+  Upload,
+  X
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
@@ -23,6 +47,7 @@ import {
   timezoneSelectLabel
 } from '../lib/timezones'
 import { collectFuturePublishCandidates } from '@services/schedule/publishSchedule'
+import { formatTimeHmFromMins, parseTimeHmToMins } from '../lib/scheduleWindowHm'
 import { ProxyStatusGlyph } from '../lib/proxyCheckDisplay'
 import adsLogo from '../../../ads_logo.jpg'
 
@@ -35,12 +60,12 @@ type BeginManualInAdsResult = Awaited<ReturnType<typeof window.electronAPI.db.oa
 type SyncProxyFromAdsResult = Awaited<ReturnType<typeof window.electronAPI.db.syncProxyFromAds>>
 type WaitManualResult = Awaited<ReturnType<typeof window.electronAPI.db.oauthWaitManual>>
 type FinishManualResult = Awaited<ReturnType<typeof window.electronAPI.db.oauthFinishManual>>
-type OAuthCheckResult = Awaited<ReturnType<typeof window.electronAPI.db.oauthCheck>>
 type GenerateMetaResult = Awaited<ReturnType<typeof window.electronAPI.ai.generateChannelMeta>>
 type UploadResult = Awaited<ReturnType<typeof window.electronAPI.db.uploadTestVideo>>
 type UpdatePublishingResult = Awaited<ReturnType<typeof window.electronAPI.db.updateChannelPublishing>>
 type DeleteChannelResult = Awaited<ReturnType<typeof window.electronAPI.db.deleteChannel>>
 type ChannelsSortField = 'ads' | 'lastVideoDate'
+type FolderVideoCountCell = { status: 'loading' } | { status: 'ok'; count: number } | { status: 'error' }
 type ChannelsSortDir = 'asc' | 'desc'
 
 const CATEGORY_OPTIONS = [
@@ -51,6 +76,26 @@ const CATEGORY_OPTIONS = [
   { id: '10', label: 'Music' },
   { id: '20', label: 'Gaming' }
 ]
+
+const thIconClass = 'h-3.5 w-3.5 shrink-0 text-sky-500/75'
+
+function AdsProxyPullGlyph(): JSX.Element {
+  return (
+    <span
+      className="relative inline-flex h-[22px] w-[22px] items-center justify-center rounded-md border border-emerald-500/35 bg-gradient-to-br from-emerald-950/55 to-industrial-bg shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+      aria-hidden
+    >
+      <img
+        src={adsLogo}
+        alt=""
+        className="h-3 w-3 rounded-[3px] object-cover shadow-sm ring-1 ring-white/12"
+      />
+      <span className="absolute -bottom-px -right-px flex h-3 w-3 items-center justify-center rounded-full bg-industrial-raised ring-1 ring-sky-400/45 shadow-sm">
+        <ArrowDownToLine className="h-1.5 w-1.5 text-sky-400" strokeWidth={3} aria-hidden />
+      </span>
+    </span>
+  )
+}
 
 function formatDateTime(value: string | null): string {
   if (!value) return '—'
@@ -69,13 +114,103 @@ function formatLastVideoDate(value: string | null): string {
   if (!value) return '—'
   const d = new Date(value)
   if (Number.isNaN(d.getTime())) return value
-  const datePart = d.toLocaleDateString('ru-RU', {
+  const rawDate = d.toLocaleDateString('ru-RU', {
     day: 'numeric',
     month: 'short',
     year: 'numeric'
   })
+  const datePart = rawDate.replace(/\s*г\.?\s*$/i, '').trim()
   const timePart = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
-  return `${datePart}г. в ${timePart}`
+  return `${datePart} г. в ${timePart}`
+}
+
+function hasPourCooldownPassed(value: string | null): boolean {
+  if (!value) return true
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return true
+  const DAY_MS = 24 * 60 * 60 * 1000
+  return Date.now() - d.getTime() >= DAY_MS
+}
+
+/** Группы слотов превью по календарному дню в часовом поясе расписания. */
+type PublishPreviewDayGroup = {
+  dayKey: string
+  dayTitle: string
+  slots: { slotIndex: number; at: Date; timeLabel: string }[]
+}
+
+function buildPublishPreviewGroups(dates: Date[], scheduleTimezone: string): PublishPreviewDayGroup[] {
+  if (dates.length === 0) return []
+  const tz = scheduleTimezone.trim() || 'UTC'
+
+  const dayKeyOf = (d: Date): string => {
+    try {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(d)
+    } catch {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'UTC',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(d)
+    }
+  }
+
+  const dayTitleOf = (d: Date): string => {
+    try {
+      const s = new Intl.DateTimeFormat('ru-RU', {
+        timeZone: tz,
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric'
+      }).format(d)
+      const trimmed = s.replace(/\s*г\.?\s*$/i, '').trim()
+      return trimmed.length > 0 ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : trimmed
+    } catch {
+      const s = d.toLocaleDateString('ru-RU', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric'
+      })
+      const trimmed = s.replace(/\s*г\.?\s*$/i, '').trim()
+      return trimmed.length > 0 ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : trimmed
+    }
+  }
+
+  const timeOf = (d: Date): string => {
+    try {
+      return new Intl.DateTimeFormat('ru-RU', {
+        timeZone: tz,
+        hour: '2-digit',
+        minute: '2-digit'
+      }).format(d)
+    } catch {
+      return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+    }
+  }
+
+  const groups: PublishPreviewDayGroup[] = []
+  for (let i = 0; i < dates.length; i++) {
+    const at = dates[i]
+    const key = dayKeyOf(at)
+    const prev = groups[groups.length - 1]
+    if (!prev || prev.dayKey !== key) {
+      groups.push({ dayKey: key, dayTitle: dayTitleOf(at), slots: [] })
+    }
+    groups[groups.length - 1].slots.push({
+      slotIndex: i + 1,
+      at,
+      timeLabel: timeOf(at)
+    })
+  }
+  return groups
 }
 
 function toDateTimeLocalValue(value: string | null): string {
@@ -175,6 +310,7 @@ export function ChannelsPage(): JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const [rowActionMsg, setRowActionMsg] = useState<string | null>(null)
   const [busyRow, setBusyRow] = useState<number | null>(null)
+  const [uploadJobs, setUploadJobs] = useState<Record<number, { cancelRequested: boolean; startedAt: string }>>({})
   const [manualFlow, setManualFlow] = useState<{ channelId: number; flowId: string; authUrl: string } | null>(null)
   const [manualCallbackUrl, setManualCallbackUrl] = useState('')
   const [manualAuthUrlCopied, setManualAuthUrlCopied] = useState(false)
@@ -194,14 +330,17 @@ export function ChannelsPage(): JSX.Element {
   const [editPublishMode, setEditPublishMode] = useState<'manual' | 'scheduled'>('manual')
   const [editScheduleStartAt, setEditScheduleStartAt] = useState('')
   const [editVideosPerDay, setEditVideosPerDay] = useState(4)
-  const [editWindowStartHour, setEditWindowStartHour] = useState(9)
-  const [editWindowEndHour, setEditWindowEndHour] = useState(23)
+  const [editWindowStartHm, setEditWindowStartHm] = useState('9:00')
+  const [editWindowEndHm, setEditWindowEndHm] = useState('23:59')
   const [editRandomizeMinutes, setEditRandomizeMinutes] = useState(45)
   const [editTimezone, setEditTimezone] = useState('Europe/Moscow')
   const [editSourceFolder, setEditSourceFolder] = useState<string | null>(null)
+  const [editFolderVideoCount, setEditFolderVideoCount] = useState<FolderVideoCountCell | null>(null)
   const [editUploadCooldownSeconds, setEditUploadCooldownSeconds] = useState(20)
   const [editAdsProfileId, setEditAdsProfileId] = useState('')
   const [checkingProxyForChannelId, setCheckingProxyForChannelId] = useState<number | null>(null)
+  const [bulkAdsOauthBusy, setBulkAdsOauthBusy] = useState(false)
+  const [folderVideoCounts, setFolderVideoCounts] = useState<Record<number, FolderVideoCountCell>>({})
   const [sortField, setSortField] = useState<ChannelsSortField>('ads')
   const [sortDir, setSortDir] = useState<ChannelsSortDir>('asc')
   const editingChannel = editingChannelId ? channels.find((x) => x.id === editingChannelId) ?? null : null
@@ -245,11 +384,14 @@ export function ChannelsPage(): JSX.Element {
             return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
           })()
         : null
+    const w0 = parseTimeHmToMins(editWindowStartHm, 9 * 60)
+    let w1 = parseTimeHmToMins(editWindowEndHm, 23 * 60 + 59)
+    if (w1 <= w0) w1 = Math.min(1439, w0 + 59)
     return collectFuturePublishCandidates({
       baseIso,
       videosPerDay: editVideosPerDay,
-      windowStartHour: editWindowStartHour,
-      windowEndHour: editWindowEndHour,
+      windowStartMins: w0,
+      windowEndMins: w1,
       randomizeMinutes: editRandomizeMinutes,
       minFuture,
       needCount: 10,
@@ -259,10 +401,15 @@ export function ChannelsPage(): JSX.Element {
     editPublishMode,
     editScheduleStartAt,
     editVideosPerDay,
-    editWindowStartHour,
-    editWindowEndHour,
+    editWindowStartHm,
+    editWindowEndHm,
     editRandomizeMinutes
   ])
+
+  const publishPreviewGroups = useMemo(
+    () => buildPublishPreviewGroups(previewTimes, editTimezone),
+    [previewTimes, editTimezone]
+  )
 
   const reload = useCallback(async () => {
     const [c, p, o] = await Promise.all([
@@ -285,16 +432,80 @@ export function ChannelsPage(): JSX.Element {
     })
   }, [])
 
+  const reloadUploadJobs = useCallback(async () => {
+    const res = await window.electronAPI.db.listActiveUploadJobs()
+    if (!res.ok) return
+    const next: Record<number, { cancelRequested: boolean; startedAt: string }> = {}
+    for (const job of res.data) {
+      next[job.channelId] = { cancelRequested: Boolean(job.cancel_requested), startedAt: job.startedAt }
+    }
+    setUploadJobs(next)
+  }, [])
+
   useEffect(() => {
-    void reload()
-  }, [reload])
+    void Promise.all([reload(), reloadUploadJobs()])
+  }, [reload, reloadUploadJobs])
 
   useEffect(() => {
     const unsubscribe = window.electronAPI.onDataChanged(() => {
-      void reload()
+      void Promise.all([reload(), reloadUploadJobs()])
     })
     return unsubscribe
-  }, [reload])
+  }, [reload, reloadUploadJobs])
+
+  useEffect(() => {
+    const targets = channels
+      .map((ch) => {
+        const p = ch.source_folder_path?.trim()
+        return p ? { id: ch.id, path: p } : null
+      })
+      .filter((x): x is { id: number; path: string } => x !== null)
+    if (targets.length === 0) {
+      setFolderVideoCounts({})
+      return
+    }
+    setFolderVideoCounts(() => {
+      const next: Record<number, FolderVideoCountCell> = {}
+      for (const { id } of targets) next[id] = { status: 'loading' }
+      return next
+    })
+    let cancelled = false
+    void Promise.all(
+      targets.map(async ({ id, path }) => {
+        const r = await window.electronAPI.fs.countVideosInFolder({ folderPath: path })
+        if (cancelled) return
+        setFolderVideoCounts((prev) => ({
+          ...prev,
+          [id]: r.ok ? { status: 'ok', count: r.count } : { status: 'error' }
+        }))
+      })
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [channels])
+
+  useEffect(() => {
+    if (!editorOpen) {
+      setEditFolderVideoCount(null)
+      return
+    }
+    const path = editSourceFolder?.trim()
+    if (!path) {
+      setEditFolderVideoCount(null)
+      return
+    }
+    setEditFolderVideoCount({ status: 'loading' })
+    let cancelled = false
+    void (async () => {
+      const r = await window.electronAPI.fs.countVideosInFolder({ folderPath: path })
+      if (cancelled) return
+      setEditFolderVideoCount(r.ok ? { status: 'ok', count: r.count } : { status: 'error' })
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [editorOpen, editSourceFolder])
 
   async function pickFolder(): Promise<void> {
     const path = await window.electronAPI.dialog.openDirectory()
@@ -372,7 +583,7 @@ export function ChannelsPage(): JSX.Element {
         setRowActionMsg(`Автозавершение не сработало: ${waitRes.error}`)
         return
       }
-      setRowActionMsg(`Канал подключен автоматически: ${waitRes.data.channel_title}`)
+      setRowActionMsg(`Канал подключен и проверен автоматически: ${waitRes.data.channel_title}`)
       setManualFlow(null)
       setManualCallbackUrl('')
       setManualAuthUrlCopied(false)
@@ -423,9 +634,12 @@ export function ChannelsPage(): JSX.Element {
   }
 
   async function uploadTest(channelId: number): Promise<void> {
-    if (busyRow !== null) return
+    if (uploadJobs[channelId]) return
     setRowActionMsg(null)
-    setBusyRow(channelId)
+    setUploadJobs((prev) => ({
+      ...prev,
+      [channelId]: { cancelRequested: false, startedAt: new Date().toISOString() }
+    }))
     try {
       const res: UploadResult = await window.electronAPI.db.uploadTestVideo({ channelId })
       if (!res.ok) {
@@ -435,10 +649,26 @@ export function ChannelsPage(): JSX.Element {
       setRowActionMsg(
         `Загрузка завершена: успешно ${res.data.uploaded}, ошибок ${res.data.failed}, сегодня ${res.data.daily_used}/${res.data.daily_limit}`
       )
-      await reload()
+      await Promise.all([reload(), reloadUploadJobs()])
     } finally {
-      setBusyRow(null)
+      await reloadUploadJobs()
     }
+  }
+
+  async function cancelUpload(channelId: number): Promise<void> {
+    setRowActionMsg(null)
+    const res = await window.electronAPI.db.cancelUpload({ channelId })
+    if (!res.ok) {
+      setRowActionMsg(`Не удалось отменить загрузку: ${res.error}`)
+      await reloadUploadJobs()
+      return
+    }
+    setUploadJobs((prev) => {
+      const row = prev[channelId]
+      if (!row) return prev
+      return { ...prev, [channelId]: { ...row, cancelRequested: true } }
+    })
+    setRowActionMsg('Остановка запрошена: текущий файл завершится, после чего пакет остановится.')
   }
 
   async function checkOAuth(channelId: number): Promise<void> {
@@ -446,10 +676,109 @@ export function ChannelsPage(): JSX.Element {
     setRowActionMsg(null)
     setBusyRow(channelId)
     try {
-      await window.electronAPI.db.oauthCheck({ channelId })
+      const res = await window.electronAPI.db.oauthCheck({ channelId })
+      if (!res.ok) setRowActionMsg(res.error)
       await reload()
     } finally {
       setBusyRow(null)
+    }
+  }
+
+  async function reconnectOAuthChannelsInAdsBulk(): Promise<void> {
+    if (bulkAdsOauthBusy || busyRow !== null) return
+    setBulkAdsOauthBusy(true)
+    setRowActionMsg(null)
+    try {
+      const seenAds = new Set<string>()
+      const queue: ChannelRow[] = []
+      for (const ch of channels) {
+        const ads = ch.ads_profile_id?.trim()
+        if (!ads) continue
+        if (ch.oauth_status === 'ok') continue
+        if (seenAds.has(ads)) continue
+        seenAds.add(ads)
+        queue.push(ch)
+      }
+      if (queue.length === 0) {
+        setRowActionMsg(
+          'Нет каналов с ADS profile id, где OAuth не в статусе «ок». Укажите ADS id в параметрах канала и сохраните, либо подключите OAuth.'
+        )
+        return
+      }
+      setRowActionMsg(`Очередь OAuth в ADS: ${queue.length} профилей. Запускаю по одному…`)
+      let done = 0
+      let failed = 0
+      for (let i = 0; i < queue.length; i += 1) {
+        const ch = queue[i]!
+        const adsLabel = (ch.ads_profile_name ?? '').trim() || (ch.ads_profile_id ?? '').trim() || `#${ch.id}`
+        setBusyRow(ch.id)
+        setRowActionMsg(`[${i + 1}/${queue.length}] Открываю OAuth в ADS: ${adsLabel}`)
+        const beginRes: BeginManualInAdsResult = await window.electronAPI.db.oauthBeginManualInAds({ channelId: ch.id })
+        if (!beginRes.ok) {
+          failed += 1
+          const msg = /fetch failed/i.test(beginRes.error)
+            ? 'Не запущен ADS Power'
+            : `Не удалось открыть OAuth в ADS для ${adsLabel}: ${beginRes.error}`
+          setRowActionMsg(`[${i + 1}/${queue.length}] ${msg}`)
+          continue
+        }
+
+        setRowActionMsg(`[${i + 1}/${queue.length}] Жду завершение OAuth: ${adsLabel}`)
+        let oauthConfirmed = false
+        let lastWaitError = ''
+        let lastCheckError = ''
+        // Иногда ADS/браузер закрывают вкладку так, что callback зависает в ожидании.
+        // Делаем короткие wait-попытки и fallback на прямой oauthCheck.
+        for (let attempt = 0; attempt < 8 && !oauthConfirmed; attempt += 1) {
+          const waitRes: WaitManualResult = await window.electronAPI.db.oauthWaitManual({
+            flowId: beginRes.data.flowId,
+            timeoutMs: 30000
+          })
+          if (waitRes.ok) {
+            oauthConfirmed = true
+            break
+          }
+          lastWaitError = waitRes.error
+          const checkRes = await window.electronAPI.db.oauthCheck({ channelId: ch.id })
+          if (checkRes.ok) {
+            oauthConfirmed = true
+            break
+          }
+          lastCheckError = checkRes.error
+          setRowActionMsg(
+            `[${i + 1}/${queue.length}] Еще жду OAuth для ${adsLabel} (попытка ${attempt + 1}/8)…`
+          )
+        }
+        if (!oauthConfirmed) {
+          failed += 1
+          const reason = lastCheckError || lastWaitError || 'таймаут подтверждения OAuth'
+          setRowActionMsg(
+            `[${i + 1}/${queue.length}] Не удалось подтвердить OAuth для ${adsLabel}: ${reason}. Перехожу к следующему профилю.`
+          )
+          continue
+        }
+
+        const checkRes = await window.electronAPI.db.oauthCheck({ channelId: ch.id })
+        if (!checkRes.ok) {
+          failed += 1
+          setRowActionMsg(
+            `[${i + 1}/${queue.length}] OAuth подтвержден, но финальный OAuth-check не прошел для ${adsLabel}: ${checkRes.error}`
+          )
+          continue
+        }
+
+        done += 1
+        setRowActionMsg(
+          `[${i + 1}/${queue.length}] OAuth подтвержден: ${checkRes.data.channel_title}. Открываю следующий профиль…`
+        )
+        await reload()
+      }
+      setBusyRow(null)
+      setRowActionMsg(`Переподключение завершено: успешно ${done}, с ошибками ${failed}.`)
+    } finally {
+      setBulkAdsOauthBusy(false)
+      setBusyRow(null)
+      await reload()
     }
   }
 
@@ -484,17 +813,28 @@ export function ChannelsPage(): JSX.Element {
     setEditCategoryId(ch.default_category_id || '22')
     setEditLanguage(ch.default_language || 'ru')
     setEditPublishMode(ch.publish_mode === 'scheduled' ? 'scheduled' : 'manual')
+    const queueLastActivity =
+      ch.last_queue_activity_at && ch.last_queue_activity_at.trim() !== '' ? ch.last_queue_activity_at : null
     const queueNext =
       ch.next_scheduled_publish_at && ch.next_scheduled_publish_at.trim() !== ''
         ? ch.next_scheduled_publish_at
         : null
     const savedStart =
       ch.schedule_start_at && ch.schedule_start_at.trim() !== '' ? ch.schedule_start_at : null
-    const startDefault = queueNext ?? savedStart
+    // Приоритет: последняя активность очереди (последнее видео/слот), чтобы новые слоты не пересекались.
+    const startDefault = queueLastActivity ?? queueNext ?? savedStart
     setEditScheduleStartAt(toDateTimeLocalValue(startDefault))
     setEditVideosPerDay(ch.schedule_videos_per_day || 4)
-    setEditWindowStartHour(ch.schedule_window_start_hour ?? 9)
-    setEditWindowEndHour(ch.schedule_window_end_hour ?? 23)
+    const startMins =
+      typeof ch.schedule_window_start_mins === 'number' && Number.isFinite(ch.schedule_window_start_mins)
+        ? ch.schedule_window_start_mins
+        : (ch.schedule_window_start_hour ?? 9) * 60
+    const endMins =
+      typeof ch.schedule_window_end_mins === 'number' && Number.isFinite(ch.schedule_window_end_mins)
+        ? ch.schedule_window_end_mins
+        : (ch.schedule_window_end_hour ?? 23) * 60 + 59
+    setEditWindowStartHm(formatTimeHmFromMins(startMins))
+    setEditWindowEndHm(formatTimeHmFromMins(endMins))
     setEditRandomizeMinutes(ch.schedule_randomize_minutes ?? 45)
     setEditTimezone(ch.schedule_timezone || 'Europe/Moscow')
     setEditSourceFolder(ch.source_folder_path ?? null)
@@ -561,6 +901,12 @@ export function ChannelsPage(): JSX.Element {
     try {
       const parsedStart = editScheduleStartAt ? new Date(editScheduleStartAt) : null
       const startIso = parsedStart && !Number.isNaN(parsedStart.getTime()) ? parsedStart.toISOString() : null
+      const w0 = parseTimeHmToMins(editWindowStartHm, 9 * 60)
+      const w1 = parseTimeHmToMins(editWindowEndHm, 23 * 60 + 59)
+      if (w1 <= w0) {
+        setRowActionMsg('Окно публикации: время «до» должно быть позже «с» (например 9:00 → 18:30).')
+        return
+      }
       const res: UpdatePublishingResult = await window.electronAPI.db.updateChannelPublishing({
         channelId: editingChannelId,
         default_description: editDescription || null,
@@ -571,8 +917,10 @@ export function ChannelsPage(): JSX.Element {
         publish_mode: editPublishMode,
         schedule_start_at: startIso,
         schedule_videos_per_day: editVideosPerDay,
-        schedule_window_start_hour: editWindowStartHour,
-        schedule_window_end_hour: editWindowEndHour,
+        schedule_window_start_mins: w0,
+        schedule_window_end_mins: w1,
+        schedule_window_start_hour: Math.floor(w0 / 60),
+        schedule_window_end_hour: Math.floor(w1 / 60),
         schedule_randomize_minutes: editRandomizeMinutes,
         schedule_timezone: editTimezone,
         source_folder_path: editSourceFolder,
@@ -597,6 +945,23 @@ export function ChannelsPage(): JSX.Element {
       <div className="border border-industrial-border bg-industrial-panel p-4">
         <div className="flex items-center justify-between">
           <div className="text-sm font-medium text-industrial-text">Каналы</div>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <button
+            type="button"
+            disabled={bulkAdsOauthBusy || busyRow !== null}
+            onClick={() => void reconnectOAuthChannelsInAdsBulk()}
+            className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-3 py-2 text-xs text-industrial-text hover:border-industrial-muted disabled:opacity-50"
+            title="Открыть привязку OAuth в ADS по очереди: один профиль за раз, с ожиданием callback и автопроверкой OAuth перед следующим"
+          >
+            {bulkAdsOauthBusy ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} aria-hidden />
+                OAuth в ADS…
+              </>
+            ) : (
+              'Переподключить OAuth (ADS)'
+            )}
+          </button>
           <button
             type="button"
             onClick={() => setShowCreateForm((v) => !v)}
@@ -611,6 +976,7 @@ export function ChannelsPage(): JSX.Element {
               </>
             )}
           </button>
+        </div>
         </div>
         {rowActionMsg ? <p className="mt-2 text-xs text-industrial-muted">{rowActionMsg}</p> : null}
         {showCreateForm ? (
@@ -774,61 +1140,94 @@ export function ChannelsPage(): JSX.Element {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto border border-industrial-border bg-industrial-panel">
-        <table className="w-full border-collapse text-left text-xs">
-          <thead className="sticky top-0 bg-industrial-raised text-industrial-muted">
+        <table className="w-full border-collapse text-left text-[11px] leading-tight">
+          <thead className="sticky top-0 bg-industrial-raised text-[10px] text-industrial-muted">
             <tr>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
                 <button
                   type="button"
                   onClick={() => toggleSort('ads')}
-                  className="inline-flex items-center gap-1 text-left hover:text-industrial-text"
+                  className="inline-flex items-center gap-1.5 text-left hover:text-industrial-text"
                   title="Сортировать по ADS"
                 >
-                  ADS
-                  {sortField === 'ads' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                  <Layers className={thIconClass} strokeWidth={2} aria-hidden />
+                  <span>
+                    ADS
+                    {sortField === 'ads' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                  </span>
                 </button>
               </th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">Название</th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">OAuth-профиль</th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">Прокси</th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">Папка</th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
+                <span className="inline-flex items-center gap-1.5">
+                  <Tv className={thIconClass} strokeWidth={2} aria-hidden />
+                  Название
+                </span>
+              </th>
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
+                <span className="inline-flex items-center gap-1.5">
+                  <KeyRound className={thIconClass} strokeWidth={2} aria-hidden />
+                  OAuth-профиль
+                </span>
+              </th>
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
+                <span className="inline-flex items-center gap-1.5">
+                  <Network className={thIconClass} strokeWidth={2} aria-hidden />
+                  Прокси
+                </span>
+              </th>
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
+                <span className="inline-flex items-center gap-1.5">
+                  <FolderOpen className={thIconClass} strokeWidth={2} aria-hidden />
+                  Папка
+                </span>
+              </th>
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
+                <span className="inline-flex items-center gap-1.5">
+                  <History className={thIconClass} strokeWidth={2} aria-hidden />
+                  Дата последнего пролива
+                </span>
+              </th>
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
                 <button
                   type="button"
                   onClick={() => toggleSort('lastVideoDate')}
-                  className="inline-flex items-center gap-1 text-left hover:text-industrial-text"
+                  className="inline-flex items-center gap-1.5 text-left hover:text-industrial-text"
                   title="Сортировать по дате последнего видео"
                 >
-                  Дата последн. видео
-                  {sortField === 'lastVideoDate' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                  <CalendarClock className={thIconClass} strokeWidth={2} aria-hidden />
+                  <span>
+                    Пролит до
+                    {sortField === 'lastVideoDate' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                  </span>
                 </button>
               </th>
-              <th className="border-b border-industrial-border px-2 py-2 font-medium">Действия</th>
+              <th className="border-b border-industrial-border px-2 py-1.5 font-medium">
+                <span className="inline-flex items-center gap-1.5">
+                  <ListVideo className={thIconClass} strokeWidth={2} aria-hidden />
+                  Действия
+                </span>
+              </th>
             </tr>
           </thead>
           <tbody className="text-industrial-text">
             {channels.length === 0 ? (
               <tr>
-                <td className="px-2 py-3 text-industrial-dim" colSpan={7}>
+                <td className="px-2 py-3 text-industrial-dim" colSpan={8}>
                   Каналов пока нет — заполните форму выше.
                 </td>
               </tr>
             ) : (
               sortedChannels.map((ch) => {
+                const activeUpload = uploadJobs[ch.id] ?? null
                 const px =
                   ch.proxy_id != null ? proxies.find((p) => p.id === ch.proxy_id) ?? null : null
                 return (
                   <tr
                     key={ch.id}
-                    className={[
-                      'border-b border-industrial-border',
-                      ch.has_live_stream === 1 ? 'bg-emerald-950/15 ring-1 ring-inset ring-emerald-600/70' : ''
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
+                    className="border-b border-industrial-border"
                   >
                     <td
-                      className="max-w-[220px] truncate px-2 py-2 text-industrial-text"
+                      className="max-w-[220px] truncate px-2 py-1.5 text-industrial-text"
                       title={
                         ch.ads_profile_id?.trim()
                           ? `${ch.ads_profile_name?.trim() ? `${ch.ads_profile_name.trim()} · ` : ''}ADS profile ID: ${ch.ads_profile_id.trim()}`
@@ -837,7 +1236,7 @@ export function ChannelsPage(): JSX.Element {
                     >
                       {ch.ads_profile_id?.trim() ? ch.ads_profile_name?.trim() || '—' : '—'}
                     </td>
-                    <td className="px-2 py-2">
+                    <td className="px-2 py-1.5">
                       <span className="inline-flex items-center gap-2">
                         <button
                           type="button"
@@ -866,24 +1265,40 @@ export function ChannelsPage(): JSX.Element {
                         <span>{ch.channel_title ?? '—'}</span>
                       </span>
                     </td>
-                    <td className="px-2 py-2 text-industrial-dim">
-                      <span className="inline-flex items-center gap-1.5">
+                    <td className="px-2 py-1.5 text-industrial-dim">
+                      <span className="inline-flex flex-wrap items-center gap-1.5">
                         {ch.oauth_status === 'ok' ? (
                           <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" strokeWidth={1.8} aria-hidden />
                         ) : ch.oauth_status === 'invalid' ? (
                           <AlertTriangle className="h-3.5 w-3.5 text-red-400" strokeWidth={1.8} aria-hidden />
                         ) : null}
                         <span>{ch.oauth_profile_label ?? (ch.oauth_profile_id != null ? `#${ch.oauth_profile_id}` : '—')}</span>
+                        <button
+                          type="button"
+                          disabled={busyRow === ch.id || !(ch.ads_profile_id && ch.ads_profile_id.trim())}
+                          onClick={() => void beginManualConnectInAds(ch.id)}
+                          className="inline-flex shrink-0 items-center justify-center rounded border border-industrial-border bg-industrial-bg p-1 text-emerald-300 hover:border-industrial-muted disabled:opacity-40"
+                          title="Открыть OAuth сразу в ADS"
+                        >
+                          <img src={adsLogo} alt="ADS" className="h-3.5 w-3.5 rounded-[2px] object-cover" />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyRow === ch.id}
+                          onClick={() => void checkOAuth(ch.id)}
+                          className="inline-flex shrink-0 items-center justify-center rounded border border-industrial-border bg-industrial-bg p-1 text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+                          title="Полная проверка OAuth (YouTube API)"
+                        >
+                          <CheckCircle2 className="h-3.5 w-3.5" strokeWidth={1.5} aria-hidden />
+                        </button>
                       </span>
                     </td>
-                    <td className="px-2 py-2 font-mono text-industrial-muted">
-                      <span className="inline-flex flex-wrap items-center gap-2">
+                    <td className="px-2 py-1.5 font-mono text-industrial-muted">
+                      <span className="inline-flex flex-wrap items-center gap-1.5">
                         {px ? (
                           <>
                             <ProxyStatusGlyph lastCheckStatus={px.last_check_status} />
-                            <span>
-                              {px.host}:{px.port}
-                            </span>
+                            <span>#{px.id}</span>
                             <button
                               type="button"
                               disabled={busyRow !== null || checkingProxyForChannelId === ch.id}
@@ -907,16 +1322,71 @@ export function ChannelsPage(): JSX.Element {
                           type="button"
                           disabled={busyRow === ch.id || !(ch.ads_profile_id && ch.ads_profile_id.trim())}
                           onClick={() => void syncProxyFromAds(ch.id)}
-                          className="inline-flex shrink-0 items-center justify-center rounded border border-industrial-border bg-industrial-bg p-1 text-sky-300 hover:border-industrial-muted disabled:opacity-40"
+                          className="inline-flex shrink-0 items-center justify-center rounded border border-industrial-border bg-industrial-bg p-0.5 text-sky-300 hover:border-emerald-500/40 hover:shadow-[0_0_0_1px_rgba(52,211,153,0.15)] disabled:opacity-40"
                           title="Подтянуть proxy из ADS profile в базу и привязать к каналу"
                         >
-                          <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          <AdsProxyPullGlyph />
                         </button>
                       </span>
                     </td>
-                    <td className="px-2 py-2 text-industrial-dim">{ch.source_folder_path ?? '—'}</td>
+                    <td className="px-2 py-1.5">
+                      {(() => {
+                        const folderPath = ch.source_folder_path?.trim()
+                        if (!folderPath) {
+                          return <span className="text-industrial-dim">—</span>
+                        }
+                        const fc = folderVideoCounts[ch.id]
+                        const countPart =
+                          fc?.status === 'ok'
+                            ? `${fc.count} видео`
+                            : fc?.status === 'error'
+                              ? '—'
+                              : '…'
+                        return (
+                          <span className="inline-flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void (async () => {
+                                  const r = await window.electronAPI.fs.openFolder({ folderPath })
+                                  if (!r.ok) setRowActionMsg(r.error)
+                                })()
+                              }}
+                              className="border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted"
+                              title={folderPath}
+                            >
+                              Перейти в папку
+                            </button>
+                            <span
+                              className="text-industrial-muted"
+                              title={
+                                fc?.status === 'error'
+                                  ? 'Не удалось посчитать файлы в папке (нет доступа или путь недействителен)'
+                                  : 'Файлы .mp4, .mov, .mkv, .avi, .webm во всех подпапках, кроме каталогов с именем uploaded'
+                              }
+                            >
+                              {countPart}
+                            </span>
+                          </span>
+                        )
+                      })()}
+                    </td>
+                    <td className="whitespace-nowrap px-2 py-1.5 text-industrial-muted">
+                      <span className="inline-flex items-center gap-1.5">
+                        {hasPourCooldownPassed(ch.last_uploaded_at ?? null) ? (
+                          <CheckCircle2
+                            className="h-3.5 w-3.5 shrink-0 text-emerald-400"
+                            strokeWidth={1.8}
+                            aria-hidden
+                          />
+                        ) : (
+                          <Clock className="h-3.5 w-3.5 shrink-0 text-amber-400" strokeWidth={1.8} aria-hidden />
+                        )}
+                        {formatLastVideoDate(ch.last_uploaded_at ?? null)}
+                      </span>
+                    </td>
                     <td
-                      className="px-2 py-2 text-industrial-muted"
+                      className="px-2 py-1.5 text-industrial-muted"
                       title="Учитываются последняя публикация и отложенные слоты в очереди. Иконка — запас по календарным дням в часовом поясе расписания канала."
                     >
                       <span className="inline-flex items-center gap-1.5">
@@ -924,62 +1394,56 @@ export function ChannelsPage(): JSX.Element {
                         {formatLastVideoDate(ch.last_queue_activity_at ?? null)}
                       </span>
                     </td>
-                    <td className="px-2 py-2">
-                      <div className="grid gap-1">
-                        <div className="flex flex-wrap gap-1">
-                          <button
-                            type="button"
-                            disabled={busyRow === ch.id}
-                            onClick={() => void uploadTest(ch.id)}
-                            className="inline-flex items-center gap-1 border border-emerald-500/60 bg-emerald-600/20 px-2 py-1 text-[11px] text-emerald-300 hover:border-emerald-400 hover:bg-emerald-600/30 disabled:opacity-40"
-                            title="Загрузить видео"
-                          >
+                    <td className="px-2 py-1.5">
+                      <div className="flex flex-nowrap items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={activeUpload?.cancelRequested === true}
+                          onClick={() => {
+                            if (activeUpload) {
+                              void cancelUpload(ch.id)
+                              return
+                            }
+                            void uploadTest(ch.id)
+                          }}
+                          className={`inline-flex shrink-0 items-center gap-1 border px-2 py-1 text-[11px] disabled:opacity-40 ${
+                            activeUpload
+                              ? 'border-red-500/60 bg-red-600/15 text-red-300 hover:border-red-400 hover:bg-red-600/25'
+                              : 'border-emerald-500/60 bg-emerald-600/20 text-emerald-300 hover:border-emerald-400 hover:bg-emerald-600/30'
+                          }`}
+                          title={activeUpload ? 'Остановить текущий пакет загрузки' : 'Загрузить видео'}
+                        >
+                          {activeUpload ? (
+                            <X className="h-3.5 w-3.5" strokeWidth={1.8} />
+                          ) : (
                             <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />
-                            <span>Загрузить видео</span>
-                          </button>
-                          <button
-                            type="button"
-                            disabled={busyRow === ch.id}
-                            onClick={() => openEditor(ch)}
-                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
-                            title="Редактировать параметры публикации"
-                          >
-                            <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          </button>
-                        </div>
-                        <div className="flex flex-wrap gap-1">
-                          <button
-                            type="button"
-                            disabled={busyRow === ch.id || !(ch.ads_profile_id && ch.ads_profile_id.trim())}
-                            onClick={() => void beginManualConnectInAds(ch.id)}
-                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-emerald-300 hover:border-industrial-muted disabled:opacity-40"
-                            title="Открыть OAuth сразу в ADS"
-                          >
-                            <img
-                              src={adsLogo}
-                              alt="ADS"
-                              className="h-3.5 w-3.5 rounded-[2px] object-cover"
-                            />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={busyRow === ch.id}
-                            onClick={() => void checkOAuth(ch.id)}
-                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
-                            title="Проверить OAuth токен канала"
-                          >
-                            <CheckCircle2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={busyRow === ch.id}
-                            onClick={() => void removeChannel(ch.id)}
-                            className="inline-flex items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-red-300 hover:border-red-400 disabled:opacity-40"
-                            title="Удалить канал"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          </button>
-                        </div>
+                          )}
+                          <span>
+                            {activeUpload
+                              ? activeUpload.cancelRequested
+                                ? 'Останавливаем…'
+                                : 'Отменить загрузку'
+                              : 'Загрузить видео'}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyRow === ch.id}
+                          onClick={() => openEditor(ch)}
+                          className="inline-flex shrink-0 items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+                          title="Редактировать параметры публикации"
+                        >
+                          <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyRow === ch.id}
+                          onClick={() => void removeChannel(ch.id)}
+                          className="inline-flex shrink-0 items-center border border-industrial-border bg-industrial-bg px-2 py-1 text-[11px] text-red-300 hover:border-red-400 disabled:opacity-40"
+                          title="Удалить канал"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -1000,41 +1464,85 @@ export function ChannelsPage(): JSX.Element {
               aria-labelledby="channel-editor-title"
             >
               <div className="shrink-0 border-b border-industrial-border px-4 py-3">
-                <div id="channel-editor-title" className="text-sm font-medium text-industrial-text">
+                <div id="channel-editor-title" className="inline-flex items-center gap-2 text-sm font-medium text-industrial-text">
+                  <Settings2 className="h-4 w-4 shrink-0 text-sky-500/80" strokeWidth={2} aria-hidden />
                   Параметры публикации канала #{editingChannelId}
                 </div>
-                <p className="mt-1 text-xs text-industrial-dim">
-                  Название видео не вводится вручную: берется из имени файла. Здесь задаются папка с исходниками, описание,
-                  категория, язык и расписание.
-                </p>
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3">
                 <div className="grid gap-2">
-                  <div className="grid gap-1 text-xs text-industrial-muted">
-                <span>Папка с видео для авто-загрузки</span>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void pickEditFolder()}
-                    className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-text hover:border-industrial-muted"
-                  >
-                    <FolderOpen className="h-4 w-4" strokeWidth={1.5} />
-                    Выбрать папку…
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setEditSourceFolder(null)}
-                    className="border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-dim hover:border-industrial-muted hover:text-industrial-text"
-                  >
-                    Сбросить
-                  </button>
-                  <span className="font-mono text-[11px] text-industrial-dim">{editSourceFolder ?? 'не выбрана'}</span>
-                </div>
+                  <div className="relative overflow-hidden rounded border border-emerald-500/25 bg-gradient-to-br from-emerald-950/25 to-industrial-bg p-3">
+                    <div className="flex gap-3">
+                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded border border-emerald-500/30 bg-industrial-bg shadow-inner">
+                        <FolderOpen className="h-5 w-5 text-emerald-400/90" strokeWidth={1.75} aria-hidden />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="inline-flex items-center gap-1.5 text-xs font-medium text-industrial-text">
+                          <Clapperboard className="h-3.5 w-3.5 text-emerald-400/80" strokeWidth={2} aria-hidden />
+                          Папка с видео для авто-загрузки
+                        </div>
+                        {editSourceFolder?.trim() ? (
+                          <>
+                            <div
+                              className="mt-1.5 break-all rounded border border-industrial-border/80 bg-industrial-panel px-2 py-1.5 font-mono text-[11px] leading-snug text-industrial-muted"
+                              title={editSourceFolder}
+                            >
+                              {editSourceFolder}
+                            </div>
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                              {editFolderVideoCount?.status === 'loading' ? (
+                                <span className="inline-flex items-center gap-1.5 rounded border border-industrial-border bg-industrial-bg px-2 py-0.5 text-[11px] text-industrial-dim">
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" strokeWidth={2} aria-hidden />
+                                  Сканирование…
+                                </span>
+                              ) : editFolderVideoCount?.status === 'ok' ? (
+                                <span className="inline-flex items-center gap-1.5 rounded border border-emerald-500/40 bg-emerald-950/40 px-2 py-0.5 text-[11px] font-medium text-emerald-200">
+                                  <Film className="h-3.5 w-3.5 shrink-0 opacity-90" strokeWidth={2} aria-hidden />
+                                  {editFolderVideoCount.count} видео
+                                  <span className="font-normal text-emerald-200/65">· без uploaded</span>
+                                </span>
+                              ) : editFolderVideoCount?.status === 'error' ? (
+                                <span className="inline-flex items-center gap-1 text-[11px] text-red-400">
+                                  <AlertCircle className="h-3.5 w-3.5" strokeWidth={2} aria-hidden />
+                                  Не удалось посчитать файлы
+                                </span>
+                              ) : null}
+                            </div>
+                          </>
+                        ) : (
+                          <p className="mt-1.5 text-[11px] text-industrial-dim">
+                            Выберите каталог с исходниками — сразу покажем, сколько в нём подходящих видео (рекурсивно,
+                            каталоги <span className="font-mono text-industrial-muted">uploaded</span> не учитываются).
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void pickEditFolder()}
+                        className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-text hover:border-industrial-muted"
+                      >
+                        <FolderOpen className="h-4 w-4" strokeWidth={1.5} aria-hidden />
+                        Выбрать папку…
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditSourceFolder(null)}
+                        className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-dim hover:border-industrial-muted hover:text-industrial-text"
+                      >
+                        <X className="h-4 w-4" strokeWidth={1.5} aria-hidden />
+                        Сбросить
+                      </button>
+                    </div>
                   </div>
 
                   <label className="grid gap-1 text-xs text-industrial-muted">
-                    ADS Profile ID (для кнопки OAuth в ADS)
+                    <span className="inline-flex items-center gap-1.5">
+                      <Hash className="h-3.5 w-3.5 shrink-0 text-sky-500/70" strokeWidth={2} aria-hidden />
+                      ADS Profile ID (для кнопки OAuth в ADS)
+                    </span>
                     <input
                       value={editAdsProfileId}
                       onChange={(ev) => setEditAdsProfileId(ev.target.value)}
@@ -1042,14 +1550,12 @@ export function ChannelsPage(): JSX.Element {
                       className="max-w-[18rem] border border-industrial-border bg-industrial-bg px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
                     />
                   </label>
-                  {editingChannel?.ads_profile_name?.trim() ? (
-                    <p className="text-[11px] text-industrial-dim">
-                      Имя в ADS (из API): {editingChannel.ads_profile_name.trim()}
-                    </p>
-                  ) : null}
 
                   <label className="grid gap-1 text-xs text-industrial-muted">
-                    Пауза между загрузками (секунды)
+                    <span className="inline-flex items-center gap-1.5">
+                      <Timer className="h-3.5 w-3.5 shrink-0 text-amber-500/70" strokeWidth={2} aria-hidden />
+                      Пауза между загрузками (секунды)
+                    </span>
                     <input
                       type="number"
                       min={0}
@@ -1061,28 +1567,54 @@ export function ChannelsPage(): JSX.Element {
                     />
                   </label>
 
-                  <div className="grid gap-2 border border-industrial-border bg-industrial-bg p-2">
+                  <div
+                    className={`relative grid gap-2 overflow-hidden border border-industrial-border bg-industrial-bg p-2 ${
+                      editAiBusy === 'description' ? 'pb-11 ring-2 ring-sky-500/40 ring-offset-0 ring-offset-industrial-bg' : ''
+                    }`}
+                  >
+                    {editAiBusy === 'description' ? (
+                      <>
+                        <div
+                          className="pointer-events-none absolute left-0 right-0 top-0 z-[1] h-0.5 overflow-hidden bg-sky-950/50"
+                          aria-hidden
+                        >
+                          <div className="h-full w-2/5 bg-gradient-to-r from-transparent via-sky-400/70 to-transparent animate-shimmer" />
+                        </div>
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[1] flex items-center justify-center gap-2 border-t border-sky-500/25 bg-gradient-to-t from-industrial-panel via-industrial-panel/95 to-transparent py-2 text-[11px] text-sky-200/95">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} aria-hidden />
+                          <span className="animate-pulse">Генерация описания…</span>
+                        </div>
+                      </>
+                    ) : null}
                     <div className="flex flex-wrap items-center gap-2 text-xs text-industrial-muted">
-                      <span>Описание видео (по умолчанию)</span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <FileText className="h-3.5 w-3.5 text-sky-500/70" strokeWidth={2} aria-hidden />
+                        Описание видео (по умолчанию)
+                      </span>
                       <button
                         type="button"
                         onClick={() => setEditDescriptionMode('manual')}
-                        className={`border px-2 py-1 ${editDescriptionMode === 'manual' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
+                        className={`inline-flex items-center gap-1 border px-2 py-1 ${editDescriptionMode === 'manual' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
                       >
-                        Вставить вручную
+                        <Pencil className="h-3 w-3" strokeWidth={2} aria-hidden />
+                        Вручную
                       </button>
                       <button
                         type="button"
                         onClick={() => setEditDescriptionMode('generate')}
-                        className={`border px-2 py-1 ${editDescriptionMode === 'generate' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
+                        className={`inline-flex items-center gap-1 border px-2 py-1 ${editDescriptionMode === 'generate' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
                       >
+                        <Sparkles className="h-3 w-3" strokeWidth={2} aria-hidden />
                         Сгенерировать
                       </button>
                     </div>
                     {editDescriptionMode === 'generate' ? (
                       <>
                         <label className="grid gap-1 text-xs text-industrial-muted">
-                          Промт: о чем видео
+                          <span className="inline-flex items-center gap-1.5">
+                            <Sparkles className="h-3 w-3 text-sky-400/70" strokeWidth={2} aria-hidden />
+                            Промт: о чем видео
+                          </span>
                           <textarea
                             rows={3}
                             value={editDescriptionPrompt}
@@ -1109,32 +1641,60 @@ export function ChannelsPage(): JSX.Element {
                       rows={4}
                       value={editDescription}
                       onChange={(ev) => setEditDescription(ev.target.value)}
-                      className="w-full border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-text outline-none focus:border-industrial-muted"
+                      className={`w-full border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-text outline-none focus:border-industrial-muted ${
+                        editAiBusy === 'description' ? 'opacity-90' : ''
+                      }`}
                     />
                   </div>
 
-                  <div className="grid gap-2 border border-industrial-border bg-industrial-bg p-2">
+                  <div
+                    className={`relative grid gap-2 overflow-hidden border border-industrial-border bg-industrial-bg p-2 ${
+                      editAiBusy === 'tags' ? 'pb-11 ring-2 ring-violet-500/40 ring-offset-0 ring-offset-industrial-bg' : ''
+                    }`}
+                  >
+                    {editAiBusy === 'tags' ? (
+                      <>
+                        <div
+                          className="pointer-events-none absolute left-0 right-0 top-0 z-[1] h-0.5 overflow-hidden bg-violet-950/50"
+                          aria-hidden
+                        >
+                          <div className="h-full w-2/5 bg-gradient-to-r from-transparent via-violet-400/70 to-transparent animate-shimmer" />
+                        </div>
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[1] flex items-center justify-center gap-2 border-t border-violet-500/25 bg-gradient-to-t from-industrial-panel via-industrial-panel/95 to-transparent py-2 text-[11px] text-violet-200/95">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} aria-hidden />
+                          <span className="animate-pulse">Генерация тегов…</span>
+                        </div>
+                      </>
+                    ) : null}
                     <div className="flex flex-wrap items-center gap-2 text-xs text-industrial-muted">
-                      <span>Теги (через запятую)</span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <Tags className="h-3.5 w-3.5 text-violet-400/80" strokeWidth={2} aria-hidden />
+                        Теги (через запятую)
+                      </span>
                       <button
                         type="button"
                         onClick={() => setEditTagsMode('manual')}
-                        className={`border px-2 py-1 ${editTagsMode === 'manual' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
+                        className={`inline-flex items-center gap-1 border px-2 py-1 ${editTagsMode === 'manual' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
                       >
-                        Вставить вручную
+                        <Pencil className="h-3 w-3" strokeWidth={2} aria-hidden />
+                        Вручную
                       </button>
                       <button
                         type="button"
                         onClick={() => setEditTagsMode('generate')}
-                        className={`border px-2 py-1 ${editTagsMode === 'generate' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
+                        className={`inline-flex items-center gap-1 border px-2 py-1 ${editTagsMode === 'generate' ? 'border-industrial-muted bg-industrial-raised text-industrial-text' : 'border-industrial-border bg-industrial-panel text-industrial-dim'}`}
                       >
+                        <Sparkles className="h-3 w-3" strokeWidth={2} aria-hidden />
                         Сгенерировать
                       </button>
                     </div>
                     {editTagsMode === 'generate' ? (
                       <>
                         <label className="grid gap-1 text-xs text-industrial-muted">
-                          Промт: о чем видео
+                          <span className="inline-flex items-center gap-1.5">
+                            <Sparkles className="h-3 w-3 text-violet-400/70" strokeWidth={2} aria-hidden />
+                            Промт: о чем видео
+                          </span>
                           <input
                             value={editTagsPrompt}
                             onChange={(ev) => setEditTagsPrompt(ev.target.value)}
@@ -1152,7 +1712,7 @@ export function ChannelsPage(): JSX.Element {
                             {editAiBusy === 'tags' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
                             {editTags ? 'Перегенерировать' : 'Сгенерировать'}
                           </button>
-                          <span className="text-[11px] text-industrial-dim">Формат: тег1, тег2... до 450 символов</span>
+                          <span className="text-[11px] text-industrial-dim">Формат: тег1, тег2… до 450 символов</span>
                         </div>
                       </>
                     ) : null}
@@ -1160,16 +1720,22 @@ export function ChannelsPage(): JSX.Element {
                       value={editTags}
                       onChange={(ev) => setEditTags(ev.target.value)}
                       placeholder="астрология, натальная карта, таро"
-                      className="border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-text outline-none focus:border-industrial-muted"
+                      className={`w-full border border-industrial-border bg-industrial-bg px-2 py-2 text-sm text-industrial-text outline-none focus:border-industrial-muted ${
+                        editAiBusy === 'tags' ? 'opacity-90' : ''
+                      }`}
                     />
-                    <div className="text-[11px] text-industrial-dim">
+                    <div className="inline-flex items-center gap-1.5 text-[11px] text-industrial-dim">
+                      <Hash className="h-3 w-3 shrink-0 opacity-70" strokeWidth={2} aria-hidden />
                       Длина строки тегов: {editTags.length}/450
                     </div>
                   </div>
 
                   <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                 <label className="grid gap-1 text-xs text-industrial-muted">
-                  Категория
+                  <span className="inline-flex items-center gap-1.5">
+                    <LayoutGrid className="h-3.5 w-3.5 shrink-0 text-amber-500/65" strokeWidth={2} aria-hidden />
+                    Категория
+                  </span>
                   <select
                     value={editCategoryId}
                     onChange={(ev) => setEditCategoryId(ev.target.value)}
@@ -1183,7 +1749,10 @@ export function ChannelsPage(): JSX.Element {
                   </select>
                 </label>
                 <label className="grid gap-1 text-xs text-industrial-muted">
-                  Язык видео и описания
+                  <span className="inline-flex items-center gap-1.5">
+                    <Languages className="h-3.5 w-3.5 shrink-0 text-sky-500/65" strokeWidth={2} aria-hidden />
+                    Язык видео и описания
+                  </span>
                   <input
                     value={editLanguage}
                     onChange={(ev) => setEditLanguage(ev.target.value)}
@@ -1194,18 +1763,23 @@ export function ChannelsPage(): JSX.Element {
                   </div>
 
                   <div className="mt-1 border border-industrial-border bg-industrial-bg p-2">
-                <div className="text-xs text-industrial-muted">Доступ и публикация</div>
-                <div className="mt-2 flex gap-4 text-xs text-industrial-text">
+                <div className="inline-flex items-center gap-1.5 text-xs font-medium text-industrial-muted">
+                  <Lock className="h-3.5 w-3.5 text-amber-500/60" strokeWidth={2} aria-hidden />
+                  Доступ и публикация
+                </div>
+                <div className="mt-2 flex flex-wrap gap-x-6 gap-y-2 text-xs text-industrial-text">
                   <label className="inline-flex items-center gap-2">
                     <input type="radio" checked={editMadeForKids === 1} onChange={() => setEditMadeForKids(1)} />
+                    <Baby className="h-3.5 w-3.5 text-industrial-muted" strokeWidth={2} aria-hidden />
                     Видео для детей
                   </label>
                   <label className="inline-flex items-center gap-2">
                     <input type="radio" checked={editMadeForKids === 0} onChange={() => setEditMadeForKids(0)} />
+                    <Globe className="h-3.5 w-3.5 text-industrial-muted" strokeWidth={2} aria-hidden />
                     Видео НЕ для детей
                   </label>
                 </div>
-                <div className="mt-2 flex gap-4 text-xs text-industrial-text">
+                <div className="mt-2 flex flex-wrap gap-x-6 gap-y-2 text-xs text-industrial-text">
                   <label className="inline-flex items-center gap-2">
                     <input
                       type="radio"
@@ -1213,6 +1787,7 @@ export function ChannelsPage(): JSX.Element {
                       checked={editPublishMode === 'manual'}
                       onChange={() => setEditPublishMode('manual')}
                     />
+                    <Hand className="h-3.5 w-3.5 text-industrial-muted" strokeWidth={2} aria-hidden />
                     Ручной режим (без отложки)
                   </label>
                   <label className="inline-flex items-center gap-2">
@@ -1222,6 +1797,7 @@ export function ChannelsPage(): JSX.Element {
                       checked={editPublishMode === 'scheduled'}
                       onChange={() => setEditPublishMode('scheduled')}
                     />
+                    <Calendar className="h-3.5 w-3.5 text-industrial-muted" strokeWidth={2} aria-hidden />
                     Отложенная публикация
                   </label>
                 </div>
@@ -1229,7 +1805,10 @@ export function ChannelsPage(): JSX.Element {
                 {editPublishMode === 'scheduled' ? (
                   <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
                     <label className="grid gap-1 text-xs text-industrial-muted">
-                      Старт расписания (дата и время)
+                      <span className="inline-flex items-center gap-1.5">
+                        <CalendarClock className="h-3.5 w-3.5 shrink-0 text-sky-500/65" strokeWidth={2} aria-hidden />
+                        Старт расписания (дата и время)
+                      </span>
                       <input
                         type="datetime-local"
                         value={editScheduleStartAt}
@@ -1238,7 +1817,10 @@ export function ChannelsPage(): JSX.Element {
                       />
                     </label>
                     <label className="grid gap-1 text-xs text-industrial-muted">
-                      Часовой пояс
+                      <span className="inline-flex items-center gap-1.5">
+                        <Globe className="h-3.5 w-3.5 shrink-0 text-emerald-500/65" strokeWidth={2} aria-hidden />
+                        Часовой пояс
+                      </span>
                       <select
                         value={editTimezone}
                         title={editTimezone}
@@ -1258,7 +1840,10 @@ export function ChannelsPage(): JSX.Element {
                       </select>
                     </label>
                     <label className="grid gap-1 text-xs text-industrial-muted">
-                      Сколько видео в день
+                      <span className="inline-flex items-center gap-1.5">
+                        <ListVideo className="h-3.5 w-3.5 shrink-0 text-amber-500/65" strokeWidth={2} aria-hidden />
+                        Сколько видео в день
+                      </span>
                       <input
                         type="number"
                         min={1}
@@ -1270,7 +1855,10 @@ export function ChannelsPage(): JSX.Element {
                       />
                     </label>
                     <label className="grid gap-1 text-xs text-industrial-muted">
-                      Рандомизация (минут ±)
+                      <span className="inline-flex items-center gap-1.5">
+                        <Timer className="h-3.5 w-3.5 shrink-0 text-violet-400/65" strokeWidth={2} aria-hidden />
+                        Рандомизация (минут ±)
+                      </span>
                       <input
                         type="number"
                         min={0}
@@ -1282,47 +1870,69 @@ export function ChannelsPage(): JSX.Element {
                       />
                     </label>
                     <label className="grid gap-1 text-xs text-industrial-muted">
-                      Окно публикации: с (час)
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="h-3.5 w-3.5 shrink-0 text-sky-500/55" strokeWidth={2} aria-hidden />
+                        Окно: с (чч:мм)
+                      </span>
                       <input
-                        type="number"
-                        min={0}
-                        max={23}
-                        value={editWindowStartHour}
-                        onChange={(ev) => setEditWindowStartHour(Number(ev.target.value))}
-                        onWheel={(ev) => (ev.currentTarget as HTMLInputElement).blur()}
-                        className="border border-industrial-border bg-industrial-panel px-2 py-2 text-sm text-industrial-text outline-none focus:border-industrial-muted"
+                        type="text"
+                        value={editWindowStartHm}
+                        onChange={(ev) => setEditWindowStartHm(ev.target.value)}
+                        placeholder="8:30"
+                        spellCheck={false}
+                        className="border border-industrial-border bg-industrial-panel px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
                       />
                     </label>
                     <label className="grid gap-1 text-xs text-industrial-muted">
-                      Окно публикации: до (час)
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="h-3.5 w-3.5 shrink-0 text-sky-500/55" strokeWidth={2} aria-hidden />
+                        Окно: до (чч:мм)
+                      </span>
                       <input
-                        type="number"
-                        min={0}
-                        max={23}
-                        value={editWindowEndHour}
-                        onChange={(ev) => setEditWindowEndHour(Number(ev.target.value))}
-                        onWheel={(ev) => (ev.currentTarget as HTMLInputElement).blur()}
-                        className="border border-industrial-border bg-industrial-panel px-2 py-2 text-sm text-industrial-text outline-none focus:border-industrial-muted"
+                        type="text"
+                        value={editWindowEndHm}
+                        onChange={(ev) => setEditWindowEndHm(ev.target.value)}
+                        placeholder="23:00"
+                        spellCheck={false}
+                        className="border border-industrial-border bg-industrial-panel px-2 py-2 font-mono text-sm text-industrial-text outline-none focus:border-industrial-muted"
                       />
                     </label>
-                    <div className="border border-industrial-border bg-industrial-panel p-2 md:col-span-2">
-                      <div className="text-xs text-industrial-muted">
-                        Превью следующих 10 времён публикации ({editTimezone || 'локальное время'})
+                    <div className="overflow-hidden rounded-sm border border-industrial-border/80 bg-industrial-panel md:col-span-2">
+                      <div className="flex items-center justify-between gap-2 border-b border-industrial-border/60 bg-industrial-raised/40 px-2 py-1">
+                        <span className="inline-flex items-center gap-1.5 text-[10px] font-medium text-industrial-muted">
+                          <Sparkles className="h-3 w-3 shrink-0 text-amber-500/65" strokeWidth={2} aria-hidden />
+                          10 слотов
+                        </span>
+                        <span className="max-w-[55%] truncate font-mono text-[10px] text-industrial-dim" title={editTimezone}>
+                          {editTimezone.trim() || 'локально'}
+                        </span>
                       </div>
                       {previewTimes.length === 0 ? (
-                        <div className="mt-1 text-xs text-industrial-dim">Нет будущих слотов по текущим настройкам.</div>
+                        <div className="px-2 py-2 text-[10px] text-industrial-dim">Нет будущих слотов.</div>
                       ) : (
-                        <div className="mt-1 grid gap-1 text-xs text-industrial-text">
-                          {previewTimes.map((t, i) => (
-                            <div key={i}>
-                              Видео {i + 1}:{' '}
-                              {t.toLocaleString('ru-RU', {
-                                year: 'numeric',
-                                month: 'short',
-                                day: '2-digit',
-                                hour: '2-digit',
-                                minute: '2-digit'
-                              })}
+                        <div className="divide-y divide-industrial-border/35">
+                          {publishPreviewGroups.map((g) => (
+                            <div key={g.dayKey}>
+                              <div className="flex items-center gap-1.5 bg-industrial-bg/70 px-2 py-0.5 text-[10px] font-medium text-industrial-text">
+                                <Calendar className="h-3 w-3 shrink-0 text-amber-500/70" strokeWidth={2} aria-hidden />
+                                <span className="capitalize leading-tight">{g.dayTitle} г.</span>
+                              </div>
+                              <ul className="m-0 list-none divide-y divide-industrial-border/20 p-0">
+                                {g.slots.map((s) => (
+                                  <li
+                                    key={`${g.dayKey}-${s.slotIndex}`}
+                                    className="flex items-center gap-2 px-2 py-0.5 hover:bg-industrial-raised/20"
+                                  >
+                                    <span
+                                      className="flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded border border-amber-500/25 bg-amber-950/30 font-mono text-[9px] font-semibold tabular-nums text-amber-100/90"
+                                      title={`#${s.slotIndex}`}
+                                    >
+                                      {s.slotIndex}
+                                    </span>
+                                    <span className="font-mono text-[11px] tabular-nums text-industrial-text">{s.timeLabel}</span>
+                                  </li>
+                                ))}
+                              </ul>
                             </div>
                           ))}
                         </div>
@@ -1333,26 +1943,32 @@ export function ChannelsPage(): JSX.Element {
                   </div>
 
                   <div className="mt-1 border border-industrial-border bg-industrial-bg p-2 text-xs text-industrial-dim">
-                <div>
-                  Последняя загруженная публикация:{' '}
-                  <span className="text-industrial-text">{formatDateTime(editingChannel?.last_uploaded_at ?? null)}</span>
+                <div className="inline-flex flex-wrap items-center gap-1.5">
+                  <History className="h-3.5 w-3.5 shrink-0 text-industrial-muted" strokeWidth={2} aria-hidden />
+                  <span>
+                    Последняя загруженная публикация:{' '}
+                    <span className="text-industrial-text">{formatDateTime(editingChannel?.last_uploaded_at ?? null)}</span>
+                  </span>
                   {editingChannel?.last_uploaded_video_id ? (
                     <>
-                      {' '}
-                      ·{' '}
+                      <span aria-hidden>·</span>
                       <a
                         href={`https://youtu.be/${editingChannel.last_uploaded_video_id}`}
-                        className="text-industrial-text underline"
+                        className="inline-flex items-center gap-1 text-industrial-text underline"
                       >
+                        <ExternalLink className="h-3 w-3 shrink-0 opacity-80" strokeWidth={2} aria-hidden />
                         открыть видео
                       </a>
                     </>
                   ) : null}
                 </div>
-                <div className="mt-1">
-                  Ближайшая отложенная публикация:{' '}
-                  <span className="text-industrial-text">
-                    {formatDateTime(editingChannel?.next_scheduled_publish_at ?? null)}
+                <div className="mt-2 inline-flex flex-wrap items-center gap-1.5">
+                  <Calendar className="h-3.5 w-3.5 shrink-0 text-industrial-muted" strokeWidth={2} aria-hidden />
+                  <span>
+                    Ближайшая отложенная публикация:{' '}
+                    <span className="text-industrial-text">
+                      {formatDateTime(editingChannel?.next_scheduled_publish_at ?? null)}
+                    </span>
                   </span>
                 </div>
                   </div>
@@ -1370,15 +1986,16 @@ export function ChannelsPage(): JSX.Element {
                     className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-3 py-2 text-sm text-industrial-text hover:border-industrial-muted disabled:opacity-40"
                     title="Техническая кнопка на случай проблем с ADS: открыть OAuth ссылкой"
                   >
-                    <Link2 className="h-4 w-4" strokeWidth={1.5} />
+                    <Link2 className="h-4 w-4" strokeWidth={1.5} aria-hidden />
                     Переподключить YouTube (ссылка)
                   </button>
                   <button
                     type="button"
                     onClick={() => void saveEditor()}
                     disabled={busyRow !== null}
-                    className="border border-industrial-border bg-industrial-raised px-3 py-2 text-sm text-industrial-text hover:border-industrial-muted disabled:opacity-40"
+                    className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-raised px-3 py-2 text-sm text-industrial-text hover:border-industrial-muted disabled:opacity-40"
                   >
+                    <Save className="h-4 w-4" strokeWidth={1.75} aria-hidden />
                     Сохранить
                   </button>
                   <button
@@ -1387,8 +2004,9 @@ export function ChannelsPage(): JSX.Element {
                       setEditorOpen(false)
                       setEditingChannelId(null)
                     }}
-                    className="border border-industrial-border bg-industrial-bg px-3 py-2 text-sm text-industrial-text hover:border-industrial-muted"
+                    className="inline-flex items-center gap-2 border border-industrial-border bg-industrial-bg px-3 py-2 text-sm text-industrial-text hover:border-industrial-muted"
                   >
+                    <X className="h-4 w-4" strokeWidth={1.75} aria-hidden />
                     Отмена
                   </button>
                 </div>

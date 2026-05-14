@@ -1,10 +1,10 @@
 import { BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { randomBytes, createHash, randomUUID } from 'node:crypto'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
-import { promises as fsp } from 'node:fs'
+import { existsSync, promises as fsp } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { basename, extname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 import { URL } from 'node:url'
 import { promisify } from 'node:util'
 import googleapis from 'googleapis'
@@ -36,6 +36,7 @@ import {
   updateChannelPublishingSettings,
   updateChannelOAuthData,
   updateChannelStreamPreviewLayout,
+  updateChannelBumperPreviewLayout,
   updateChannelAdsProfileName,
   updateProxyCheckStatus,
   updateChannelProxyBinding,
@@ -60,17 +61,28 @@ import {
   updateStreamer,
   updateStreamerProcessState
 } from '@services/db/streamersQueries'
-import { getStreamerRuntimeUsedProxy, getStreamerRuntimeVideoBitrateKbps, startStreamer, stopStreamer } from './streamerManager'
 import {
+  cancelStreamerMainPrebake,
+  getStreamerMainPrebakeStatus,
+  getStreamerRuntimeUsedProxy,
+  getStreamerRuntimeVideoBitrateKbps,
+  openStreamRuntimeConsoleWindow,
+  startStreamerMainPrebake,
+  startStreamer,
+  stopStreamer
+} from './streamerManager'
+import {
+  collectBackgroundMusicFiles,
   collectSegmentVideos,
   sanitizeStreamerFsPathForDb,
   unlinkQuiet,
+  writeBackgroundMusicShuffledConcatList,
   writeConcatListFileMultiOrderedPasses,
   writeConcatListFileMultiShuffledPasses,
   writeSingleSegmentConcatListMultiPasses
 } from '@services/stream/streamerConcat'
-import { getMediaDurationSeconds } from '@services/stream/ffprobe'
-import { buildFfmpegStreamArgs } from '@services/stream/streamerFfmpeg'
+import { ffprobeHasAudioStream, getMediaDurationSeconds } from '@services/stream/ffprobe'
+import { buildFfmpegStreamArgs, normalizeStreamVideoOutput, parsePreviewMusicVolumeFromLayoutJson } from '@services/stream/streamerFfmpeg'
 import { sendTelegramNotification } from '@services/telegram/notifier'
 import { openOAuthInAppWindow } from './oauthWindow'
 import { openStreamPreviewWindow } from './streamPreviewWindow'
@@ -94,10 +106,16 @@ type PendingManualOAuth = {
   redirectUri: string
   proxy?: ProxyRow
 }
+type ActiveUploadJob = {
+  channelId: number
+  startedAtIso: string
+  cancelRequested: boolean
+}
 
 const pendingManualOAuth = new Map<string, PendingManualOAuth>()
 const pendingManualOAuthByState = new Map<string, string>()
 const pendingManualOAuthCallbacks = new Map<string, string>()
+const activeUploadJobs = new Map<number, ActiveUploadJob>()
 let manualOAuthCallbackServerStarted = false
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm'])
@@ -136,6 +154,115 @@ function createPkce(): { verifier: string; challenge: string } {
 
 function getOAuthClientCredentials(channelId: number) {
   return getOAuthClientCredentialsForChannel(channelId)
+}
+
+/** Access token + scope (без вызова YouTube Data API). */
+async function oauthProbeChannelAccess(
+  channelId: number
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const creds = getOAuthClientCredentials(channelId)
+    const channel = creds.channel
+    if (!channel?.oauth_refresh_token?.trim()) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'OAuth не подключен: нет refresh token' }
+    }
+    const oauth2 = new google.auth.OAuth2(creds.clientId, creds.clientSecret)
+    oauth2.setCredentials({
+      refresh_token: channel.oauth_refresh_token,
+      access_token: channel.oauth_access_token ?? undefined
+    })
+    if (creds.proxy) {
+      google.options({ agent: new SocksProxyAgent(buildSocks5Url(creds.proxy)) })
+    } else {
+      google.options({ agent: undefined })
+    }
+    const at = await oauth2.getAccessToken()
+    const accessToken = typeof at === 'string' ? at : at?.token
+    if (!accessToken) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'Не удалось получить access_token' }
+    }
+    const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2 })
+    const tokenInfo = await oauth2Api.tokeninfo({ access_token: accessToken })
+    const scopeRaw = String(tokenInfo.data.scope ?? '').trim()
+    const scopes = scopeRaw ? scopeRaw.split(/\s+/) : []
+    const hasUploadScope =
+      scopes.includes('https://www.googleapis.com/auth/youtube.upload') ||
+      scopes.includes('https://www.googleapis.com/auth/youtube') ||
+      scopes.includes('https://www.googleapis.com/auth/youtube.force-ssl')
+    if (!hasUploadScope) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'Недостаточно OAuth scope для YouTube upload' }
+    }
+    updateChannelOAuthData({ channelId, oauth_status: 'ok' })
+    return { ok: true }
+  } catch (e) {
+    updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+async function oauthCheckChannelFull(
+  channelId: number
+): Promise<
+  | { ok: true; data: { youtube_channel_id: string; channel_title: string } }
+  | { ok: false; error: string }
+> {
+  try {
+    const creds = getOAuthClientCredentials(channelId)
+    const channel = creds.channel
+    if (!channel?.oauth_refresh_token?.trim()) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'OAuth не подключен: нет refresh token' }
+    }
+    const oauth2 = new google.auth.OAuth2(creds.clientId, creds.clientSecret)
+    oauth2.setCredentials({
+      refresh_token: channel.oauth_refresh_token,
+      access_token: channel.oauth_access_token ?? undefined
+    })
+    if (creds.proxy) {
+      google.options({ agent: new SocksProxyAgent(buildSocks5Url(creds.proxy)) })
+    } else {
+      google.options({ agent: undefined })
+    }
+    const at = await oauth2.getAccessToken()
+    const accessToken = typeof at === 'string' ? at : at?.token
+    if (!accessToken) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'Не удалось получить access_token' }
+    }
+    const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2 })
+    const tokenInfo = await oauth2Api.tokeninfo({ access_token: accessToken })
+    const scopeRaw = String(tokenInfo.data.scope ?? '').trim()
+    const scopes = scopeRaw ? scopeRaw.split(/\s+/) : []
+    const hasUploadScope =
+      scopes.includes('https://www.googleapis.com/auth/youtube.upload') ||
+      scopes.includes('https://www.googleapis.com/auth/youtube') ||
+      scopes.includes('https://www.googleapis.com/auth/youtube.force-ssl')
+    if (!hasUploadScope) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'Недостаточно OAuth scope для YouTube upload' }
+    }
+    const yt = google.youtube({ version: 'v3', auth: oauth2 })
+    const mine = await yt.channels.list({ part: ['id', 'snippet'], mine: true })
+    const item = mine.data.items?.[0]
+    if (!item?.id) {
+      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+      return { ok: false, error: 'OAuth валиден, но YouTube не вернул канал' }
+    }
+    updateChannelOAuthData({ channelId, oauth_status: 'ok' })
+    return {
+      ok: true,
+      data: {
+        youtube_channel_id: item.id,
+        channel_title: item.snippet?.title ?? item.id
+      }
+    }
+  } catch (e) {
+    updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
 }
 
 function renderOAuthCallbackPage(message: string): string {
@@ -214,6 +341,14 @@ async function beginManualOAuthFlow(channelId: number): Promise<{ flowId: string
   return { flowId, authUrl }
 }
 
+function cleanupManualOAuthFlow(flowId: string): void {
+  const flow = pendingManualOAuth.get(flowId)
+  if (!flow) return
+  pendingManualOAuth.delete(flowId)
+  pendingManualOAuthByState.delete(flow.state)
+  pendingManualOAuthCallbacks.delete(flowId)
+}
+
 async function finishManualOAuthFlow(flowId: string, callbackUrl: string) {
   const flow = pendingManualOAuth.get(flowId)
   if (!flow) return { ok: false as const, error: 'OAuth-сессия устарела. Сгенерируйте новую ссылку.' }
@@ -249,9 +384,7 @@ async function finishManualOAuthFlow(flowId: string, callbackUrl: string) {
       oauth_status: 'ok',
       token_expires_at: tokenResp.tokens.expiry_date ? new Date(tokenResp.tokens.expiry_date).toISOString() : null
     })
-    pendingManualOAuth.delete(flowId)
-    pendingManualOAuthByState.delete(flow.state)
-    pendingManualOAuthCallbacks.delete(flowId)
+    cleanupManualOAuthFlow(flowId)
     logEvent({
       channel_id: flow.channelId,
       level: 'info',
@@ -518,7 +651,8 @@ async function listVideosForUpload(rootFolder: string): Promise<string[]> {
     for (const entry of entries) {
       const full = join(dir, entry.name)
       if (entry.isDirectory()) {
-        if (entry.name.toLowerCase() === 'uploaded') continue
+        const folderName = entry.name.toLowerCase()
+        if (folderName === 'uploaded' || folderName === 'uploading') continue
         await walk(full)
         continue
       }
@@ -531,9 +665,22 @@ async function listVideosForUpload(rootFolder: string): Promise<string[]> {
   return out
 }
 
+/** Форматы, для которых предпросмотр берёт файл как есть (остальные растровые — через ffmpeg → PNG). */
+const PREVIEW_OVERLAY_IMAGE_EXT_AS_IS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.jfif',
+  '.webp',
+  '.gif',
+  '.bmp',
+  '.apng',
+  '.ico'
+])
+
 async function captureSingleFrameImage(inputPath: string, tag: string): Promise<string> {
   const ext = extname(inputPath).toLowerCase()
-  if (ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp') return inputPath
+  if (PREVIEW_OVERLAY_IMAGE_EXT_AS_IS.has(ext)) return inputPath
   const outPath = join(tmpdir(), `ytu-preview-${tag}-${randomBytes(6).toString('hex')}.png`)
   let seekSec = 1
   try {
@@ -608,6 +755,9 @@ function extensionFromDataImageMime(mime: string): string {
   if (m === 'image/jpeg' || m === 'image/jpg') return '.jpg'
   if (m === 'image/webp') return '.webp'
   if (m === 'image/bmp') return '.bmp'
+  if (m === 'image/avif') return '.avif'
+  if (m === 'image/heic' || m === 'image/heif') return '.heic'
+  if (m === 'image/tiff') return '.tiff'
   return '.img'
 }
 
@@ -702,11 +852,23 @@ async function renderMinuteWithProgress(input: {
 }
 
 async function buildPreviewRenderConcatList(payload: {
+  preview_focus?: 'stream' | 'bumper'
   stream_mode?: 'random' | 'ordered' | 'single'
   segments_folder_path?: string | null
   single_segment_path?: string | null
   bumper_video_path?: string | null
+  bumper_overlay_path?: string | null
 }): Promise<string> {
+  if (payload?.preview_focus === 'bumper') {
+    const bumper = String(payload?.bumper_video_path ?? '').trim()
+    if (bumper) return writeSingleSegmentConcatListMultiPasses({ segmentPath: bumper })
+    const overlay = String(payload?.bumper_overlay_path ?? '').trim()
+    if (!overlay) throw new Error('Выберите видео начальной сцены или оверлей')
+    if (!/\.(mp4|mov|mkv|webm|avi|m4v|gif)$/i.test(overlay)) {
+      throw new Error('Для рендера 1 минуты с начальной сценой без видео используйте видео/GIF оверлей')
+    }
+    return writeSingleSegmentConcatListMultiPasses({ segmentPath: overlay })
+  }
   const mode = payload?.stream_mode === 'ordered' || payload?.stream_mode === 'single' ? payload.stream_mode : 'random'
   const bumperPath = String(payload?.bumper_video_path ?? '').trim()
   const bumperNorm = normalizeFsPathForCompare(bumperPath)
@@ -753,6 +915,65 @@ async function moveToUploadedFolder(filePath: string, rootFolder: string): Promi
   }
   await fsp.rename(filePath, target)
   return target
+}
+
+async function moveToUploadingFolder(filePath: string, rootFolder: string, channelId: number): Promise<string> {
+  const uploadingDir = join(rootFolder, 'uploading')
+  await fsp.mkdir(uploadingDir, { recursive: true })
+  const base = basename(filePath)
+  let target = join(uploadingDir, base)
+  try {
+    await fsp.access(target)
+    const stamp = new Date().toISOString().replaceAll(':', '-')
+    const ext = extname(base)
+    const name = base.slice(0, ext ? -ext.length : undefined)
+    target = join(uploadingDir, `${name}-ch${channelId}-${stamp}${ext}`)
+  } catch {
+    // target does not exist, use as is
+  }
+  await fsp.rename(filePath, target)
+  return target
+}
+
+async function moveBackToSourceOnUploadFailure(filePath: string, originalPath: string): Promise<string> {
+  const sourceDir = dirname(originalPath)
+  await fsp.mkdir(sourceDir, { recursive: true })
+  const base = basename(originalPath)
+  let target = join(sourceDir, base)
+  try {
+    await fsp.access(target)
+    const stamp = new Date().toISOString().replaceAll(':', '-')
+    const ext = extname(base)
+    const name = base.slice(0, ext ? -ext.length : undefined)
+    target = join(sourceDir, `${name}-retry-${stamp}${ext}`)
+  } catch {
+    // target does not exist, use as is
+  }
+  await fsp.rename(filePath, target)
+  return target
+}
+
+async function claimRandomVideoForUpload(input: {
+  rootFolder: string
+  channelId: number
+  excludeOriginalPaths?: Set<string>
+}): Promise<{ originalPath: string; workingPath: string } | null> {
+  const exclude = input.excludeOriginalPaths ?? new Set<string>()
+  const candidates = randomShuffle(await listVideosForUpload(input.rootFolder)).filter((p) => !exclude.has(p))
+  for (const candidate of candidates) {
+    try {
+      const workingPath = await moveToUploadingFolder(candidate, input.rootFolder, input.channelId)
+      return { originalPath: candidate, workingPath }
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException
+      if (err?.code === 'ENOENT') {
+        // Another parallel uploader already claimed this file.
+        continue
+      }
+      throw e
+    }
+  }
+  return null
 }
 
 function escapeHtml(s: string): string {
@@ -807,6 +1028,42 @@ export function registerIpcHandlers(): void {
       if (!win.isDestroyed()) {
         win.webContents.send('app:dataChanged', { actionType, at: Date.now() })
       }
+    }
+  }
+
+  type OauthStartupPayload =
+    | { phase: 'start' }
+    | { phase: 'progress'; channelId: number; index: number; total: number }
+    | { phase: 'end' }
+
+  const emitOAuthStartupCheck = (payload: OauthStartupPayload): void => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send('app:oauthStartupCheck', payload)
+      }
+    }
+  }
+
+  async function runStartupOAuthChecksForAllChannels(): Promise<void> {
+    emitOAuthStartupCheck({ phase: 'start' })
+    let rows: ReturnType<typeof listChannels>
+    try {
+      rows = listChannels()
+    } catch {
+      emitOAuthStartupCheck({ phase: 'end' })
+      emitDataChanged('oauth_startup_check')
+      return
+    }
+    const total = rows.length
+    try {
+      for (let i = 0; i < rows.length; i++) {
+        const ch = rows[i]!
+        emitOAuthStartupCheck({ phase: 'progress', channelId: ch.id, index: i + 1, total })
+        await oauthCheckChannelFull(ch.id).catch(() => {})
+      }
+    } finally {
+      emitOAuthStartupCheck({ phase: 'end' })
+      emitDataChanged('oauth_startup_check')
     }
   }
 
@@ -965,60 +1222,19 @@ export function registerIpcHandlers(): void {
     if (!Number.isFinite(channelId) || channelId < 1) {
       return { ok: false as const, error: 'Некорректный channelId' }
     }
-    try {
-      const creds = getOAuthClientCredentials(channelId)
-      const channel = creds.channel
-      if (!channel?.oauth_refresh_token?.trim()) {
-        updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
-        return { ok: false as const, error: 'OAuth не подключен: нет refresh token' }
-      }
-      const oauth2 = new google.auth.OAuth2(creds.clientId, creds.clientSecret)
-      oauth2.setCredentials({
-        refresh_token: channel.oauth_refresh_token,
-        access_token: channel.oauth_access_token ?? undefined
-      })
-      if (creds.proxy) {
-        google.options({ agent: new SocksProxyAgent(buildSocks5Url(creds.proxy)) })
-      } else {
-        google.options({ agent: undefined })
-      }
-      const at = await oauth2.getAccessToken()
-      const accessToken = typeof at === 'string' ? at : at?.token
-      if (!accessToken) {
-        updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
-        return { ok: false as const, error: 'Не удалось получить access_token' }
-      }
-      const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2 })
-      const tokenInfo = await oauth2Api.tokeninfo({ access_token: accessToken })
-      const scopeRaw = String(tokenInfo.data.scope ?? '').trim()
-      const scopes = scopeRaw ? scopeRaw.split(/\s+/) : []
-      const hasUploadScope =
-        scopes.includes('https://www.googleapis.com/auth/youtube.upload') ||
-        scopes.includes('https://www.googleapis.com/auth/youtube') ||
-        scopes.includes('https://www.googleapis.com/auth/youtube.force-ssl')
-      if (!hasUploadScope) {
-        updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
-        return { ok: false as const, error: 'Недостаточно OAuth scope для YouTube upload' }
-      }
-      const yt = google.youtube({ version: 'v3', auth: oauth2 })
-      const mine = await yt.channels.list({ part: ['id', 'snippet'], mine: true })
-      const item = mine.data.items?.[0]
-      if (!item?.id) {
-        updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
-        return { ok: false as const, error: 'OAuth валиден, но YouTube не вернул канал' }
-      }
-      updateChannelOAuthData({ channelId, oauth_status: 'ok' })
-      return {
-        ok: true as const,
-        data: {
-          youtube_channel_id: item.id,
-          channel_title: item.snippet?.title ?? item.id
-        }
-      }
-    } catch (e) {
-      updateChannelOAuthData({ channelId, oauth_status: 'invalid' })
-      return { ok: false as const, error: e instanceof Error ? e.message : String(e) }
+    const r = await oauthCheckChannelFull(channelId)
+    if (!r.ok) return { ok: false as const, error: r.error }
+    return { ok: true as const, data: r.data }
+  })
+
+  ipcMain.handle('channels:oauthProbe', async (_e, payload: { channelId: number }) => {
+    const channelId = Number(payload?.channelId)
+    if (!Number.isFinite(channelId) || channelId < 1) {
+      return { ok: false as const, error: 'Некорректный channelId' }
     }
+    const r = await oauthProbeChannelAccess(channelId)
+    if (!r.ok) return { ok: false as const, error: r.error }
+    return { ok: true as const, data: {} }
   })
 
   ipcMain.handle('channels:oauthBeginManual', async (_e, payload: { channelId: number }) => {
@@ -1070,7 +1286,8 @@ export function registerIpcHandlers(): void {
         baseUrl: apiBaseUrl,
         apiKey,
         profileId: adsProfileId,
-        url: flow.authUrl
+        url: flow.authUrl,
+        openInNewTab: true
       })
       logEvent({
         channel_id: channelId,
@@ -1134,16 +1351,70 @@ export function registerIpcHandlers(): void {
     const timeoutMsRaw = Number(payload?.timeoutMs ?? 180000)
     const timeoutMs = Number.isFinite(timeoutMsRaw) ? Math.max(10_000, Math.min(900_000, timeoutMsRaw)) : 180000
     const startedAt = Date.now()
+    let lastProxyCheckAt = 0
+    let lastProxyHealth: boolean | null = null
+    let lastOAuthCheckAt = 0
+    const TICK_MS = 500
+    const PROXY_CHECK_EVERY_MS = 10_000
+    const OAUTH_CHECK_EVERY_MS = 10_000
     while (Date.now() - startedAt < timeoutMs) {
+      const flow = pendingManualOAuth.get(flowId)
+      if (!flow) {
+        return { ok: false as const, error: 'OAuth-сессия устарела. Запустите привязку заново.' }
+      }
       const callbackUrl = pendingManualOAuthCallbacks.get(flowId)
       if (callbackUrl) {
         pendingManualOAuthCallbacks.delete(flowId)
-        return finishManualOAuthFlow(flowId, callbackUrl)
+        const finishRes = await finishManualOAuthFlow(flowId, callbackUrl)
+        if (!finishRes.ok) return finishRes
+        const checkRes = await oauthCheckChannelFull(finishRes.data.channelId)
+        if (!checkRes.ok) {
+          return { ok: false as const, error: `OAuth завершён, но авто-проверка не прошла: ${checkRes.error}` }
+        }
+        return finishRes
       }
-      if (!pendingManualOAuth.has(flowId)) {
-        return { ok: false as const, error: 'OAuth-сессия устарела. Запустите привязку заново.' }
+
+      const now = Date.now()
+      if (flow.proxy && now - lastProxyCheckAt >= PROXY_CHECK_EVERY_MS) {
+        lastProxyCheckAt = now
+        const proxyHealth = await checkSocks5Proxy({
+          host: flow.proxy.host,
+          port: flow.proxy.port,
+          login: flow.proxy.login,
+          password: flow.proxy.password,
+          timeoutMs: 8000
+        })
+        const proxyOk = proxyHealth.ok
+        if (lastProxyHealth === null || lastProxyHealth !== proxyOk) {
+          lastProxyHealth = proxyOk
+          logEvent({
+            channel_id: flow.channelId,
+            level: proxyOk ? 'info' : 'warn',
+            action_type: proxyOk ? 'oauth_ads_proxy_ok' : 'oauth_ads_proxy_down',
+            message: proxyOk
+              ? `Прокси ADS доступен: ${flow.proxy.host}:${flow.proxy.port}`
+              : `Прокси ADS недоступен: ${proxyHealth.error}`
+          })
+        }
       }
-      await sleep(500)
+
+      if (now - lastOAuthCheckAt >= OAUTH_CHECK_EVERY_MS) {
+        lastOAuthCheckAt = now
+        const checkRes = await oauthCheckChannelFull(flow.channelId)
+        if (checkRes.ok) {
+          cleanupManualOAuthFlow(flowId)
+          return {
+            ok: true as const,
+            data: {
+              channelId: flow.channelId,
+              youtube_channel_id: checkRes.data.youtube_channel_id,
+              channel_title: checkRes.data.channel_title
+            }
+          }
+        }
+      }
+
+      await sleep(TICK_MS)
     }
     return { ok: false as const, error: 'Таймаут ожидания OAuth callback. Можно завершить вручную через callback URL.' }
   })
@@ -1153,6 +1424,15 @@ export function registerIpcHandlers(): void {
     if (!Number.isFinite(channelId) || channelId < 1) {
       return { ok: false, error: 'Некорректный channelId' } as const
     }
+    if (activeUploadJobs.has(channelId)) {
+      return { ok: false as const, error: 'Загрузка уже выполняется для этого канала' }
+    }
+    const activeJob: ActiveUploadJob = {
+      channelId,
+      startedAtIso: new Date().toISOString(),
+      cancelRequested: false
+    }
+    activeUploadJobs.set(channelId, activeJob)
     try {
       const DAILY_LIMIT = 10
       const creds = getOAuthClientCredentials(channelId)
@@ -1172,18 +1452,16 @@ export function registerIpcHandlers(): void {
       if (!sourceFolder) {
         return { ok: false as const, error: 'У канала не выбрана папка source_folder_path' }
       }
-      const allCandidates = await listVideosForUpload(sourceFolder)
-      if (allCandidates.length === 0) {
+      const initialCandidates = await listVideosForUpload(sourceFolder)
+      if (initialCandidates.length === 0) {
         return { ok: false as const, error: 'В исходной папке нет видео для загрузки' }
       }
-      const shuffled = randomShuffle(allCandidates)
-      const selected = shuffled.slice(0, remainingToday)
-      if (allCandidates.length > selected.length) {
+      if (initialCandidates.length > remainingToday) {
         logEvent({
           channel_id: channelId,
           level: 'warn',
           action_type: 'upload_daily_limit_trim',
-          message: `Найдено ${allCandidates.length} файлов, загружаем только ${selected.length} из-за лимита ${DAILY_LIMIT}/сутки`
+          message: `Найдено ${initialCandidates.length} файлов, загружаем только ${remainingToday} из-за лимита ${DAILY_LIMIT}/сутки`
         })
       }
 
@@ -1221,26 +1499,48 @@ export function registerIpcHandlers(): void {
 
       let uploadedCount = 0
       let failedCount = 0
+      let selectedCount = 0
       const videoIds: string[] = []
       let stopByDailyUploadCap = false
+      const attemptedPaths = new Set<string>()
       const appSettings = getAppSettings()
       const chCd = Number(creds.channel?.upload_cooldown_seconds)
       const fromChannel = Number.isFinite(chCd) ? chCd : NaN
       const fallbackRaw = Number(appSettings[SETTINGS_KEYS.upload_cooldown_seconds] ?? '20')
       const cooldownSecondsRaw = Number.isFinite(fromChannel) ? fromChannel : fallbackRaw
       const cooldownSeconds = Number.isFinite(cooldownSecondsRaw) ? Math.max(0, Math.min(3600, cooldownSecondsRaw)) : 20
+      let cancelledByUser = false
 
-      for (let idx = 0; idx < selected.length; idx += 1) {
-        if (stopByDailyUploadCap) break
-        const filePath = selected[idx]!
+      while (uploadedCount < remainingToday && !stopByDailyUploadCap) {
+        if (activeJob.cancelRequested) {
+          cancelledByUser = true
+          break
+        }
+        const claimed = await claimRandomVideoForUpload({
+          rootFolder: sourceFolder,
+          channelId,
+          excludeOriginalPaths: attemptedPaths
+        })
+        if (!claimed) break
+        attemptedPaths.add(claimed.originalPath)
+        selectedCount += 1
+        const filePath = claimed.workingPath
+        const wStartDb = Number(creds.channel?.schedule_window_start_mins)
+        const wEndDb = Number(creds.channel?.schedule_window_end_mins)
+        const windowStartMins = Number.isFinite(wStartDb)
+          ? Math.max(0, Math.min(1439, Math.floor(wStartDb)))
+          : Math.max(0, Math.min(23, Number(creds.channel?.schedule_window_start_hour) || 9)) * 60
+        const windowEndMins = Number.isFinite(wEndDb)
+          ? Math.max(0, Math.min(1439, Math.floor(wEndDb)))
+          : Math.max(0, Math.min(23, Number(creds.channel?.schedule_window_end_hour) || 23)) * 60 + 59
         const publishAt =
           creds.channel?.publish_mode === 'scheduled'
             ? computeScheduledPublishAtIso({
                 baseIso: creds.channel?.schedule_start_at ?? null,
-                futureSlotIndex: idx,
+                futureSlotIndex: uploadedCount,
                 videosPerDay: creds.channel?.schedule_videos_per_day ?? 4,
-                windowStartHour: creds.channel?.schedule_window_start_hour ?? 9,
-                windowEndHour: creds.channel?.schedule_window_end_hour ?? 23,
+                windowStartMins,
+                windowEndMins,
                 randomizeMinutes: creds.channel?.schedule_randomize_minutes ?? 45
               })
             : null
@@ -1252,12 +1552,12 @@ export function registerIpcHandlers(): void {
           channel_id: channelId,
           level: 'info',
           action_type: 'upload_started',
-          message: `Загрузка начата: ${filePath}`
+          message: `Загрузка начата: ${claimed.originalPath}`
         })
         const q = insertUploadQueueItem({
           channel_id: channelId,
-          file_path: filePath,
-          original_filename: filePath.split(/[\\/]/).filter(Boolean).at(-1) ?? filePath,
+          file_path: claimed.originalPath,
+          original_filename: claimed.originalPath.split(/[\\/]/).filter(Boolean).at(-1) ?? claimed.originalPath,
           status: 'uploading',
           scheduled_publish_at: publishAt,
           privacy_status: 'private',
@@ -1287,6 +1587,7 @@ export function registerIpcHandlers(): void {
             error_message: null
           })
           const movedTo = await moveToUploadedFolder(filePath, sourceFolder)
+          const successOrdinal = uploadedCount + 1
           uploadedCount += 1
           videoIds.push(uploaded.videoId)
           logEvent({
@@ -1295,7 +1596,7 @@ export function registerIpcHandlers(): void {
             level: 'info',
             action_type: 'upload_success',
             message: `Видео загружено: ${uploaded.videoId}`,
-            metadata: { video_id: uploaded.videoId, moved_to: movedTo, upload_index: idx + 1, upload_total: selected.length }
+            metadata: { video_id: uploaded.videoId, moved_to: movedTo, upload_index: successOrdinal, upload_total: remainingToday }
           })
         } catch (fileError) {
           failedCount += 1
@@ -1318,8 +1619,21 @@ export function registerIpcHandlers(): void {
             queue_id: q.id,
             level: 'error',
             action_type: 'upload_failed',
-            message: `Файл ${filePath}: ${fileMessage}`
+            message: `Файл ${claimed.originalPath}: ${fileMessage}`
           })
+          try {
+            const returnedTo = await moveBackToSourceOnUploadFailure(filePath, claimed.originalPath)
+            attemptedPaths.add(returnedTo)
+            logEvent({
+              channel_id: channelId,
+              queue_id: q.id,
+              level: 'warn',
+              action_type: 'upload_requeued',
+              message: `Файл возвращён в исходную папку после ошибки: ${returnedTo}`
+            })
+          } catch {
+            // If rollback fails, keep the original upload error as primary.
+          }
           if (uploadCapReached) {
             logEvent({
               channel_id: channelId,
@@ -1329,18 +1643,38 @@ export function registerIpcHandlers(): void {
             })
           }
         }
-        if (idx < selected.length - 1 && cooldownSeconds > 0) {
+        if (!stopByDailyUploadCap && uploadedCount < remainingToday && cooldownSeconds > 0) {
+          if (activeJob.cancelRequested) {
+            cancelledByUser = true
+            break
+          }
           logEvent({
             channel_id: channelId,
             level: 'info',
             action_type: 'upload_cooldown_wait',
             message: `Пауза между загрузками: ${cooldownSeconds} сек`
           })
-          await sleep(cooldownSeconds * 1000)
+          for (let s = 0; s < cooldownSeconds; s += 1) {
+            if (activeJob.cancelRequested) {
+              cancelledByUser = true
+              break
+            }
+            await sleep(1000)
+          }
+          if (cancelledByUser) break
         }
       }
 
       const usedNow = doneToday + uploadedCount
+      if (cancelledByUser) {
+        logEvent({
+          channel_id: channelId,
+          level: 'warn',
+          action_type: 'upload_batch_cancelled',
+          message: `Пакет остановлен пользователем: успешно ${uploadedCount}, ошибок ${failedCount}, сегодня ${usedNow}/${DAILY_LIMIT}`,
+          metadata: { uploaded_count: uploadedCount, failed_count: failedCount }
+        })
+      }
       logEvent({
         channel_id: channelId,
         level: 'info',
@@ -1354,7 +1688,7 @@ export function registerIpcHandlers(): void {
         data: {
           uploaded: uploadedCount,
           failed: failedCount,
-          selected: selected.length,
+          selected: selectedCount,
           daily_used: usedNow,
           daily_limit: DAILY_LIMIT,
           videoIds
@@ -1369,6 +1703,40 @@ export function registerIpcHandlers(): void {
         message
       })
       return { ok: false as const, error: message }
+    } finally {
+      activeUploadJobs.delete(channelId)
+    }
+  })
+
+  ipcMain.handle('channels:cancelUpload', (_event, payload: { channelId: number }) => {
+    const channelId = Number(payload?.channelId)
+    if (!Number.isFinite(channelId) || channelId < 1) {
+      return { ok: false as const, error: 'Некорректный channelId' }
+    }
+    const job = activeUploadJobs.get(channelId)
+    if (!job) {
+      return { ok: false as const, error: 'Для канала сейчас нет активной загрузки' }
+    }
+    if (!job.cancelRequested) {
+      job.cancelRequested = true
+      logEvent({
+        channel_id: channelId,
+        level: 'warn',
+        action_type: 'upload_cancel_requested',
+        message: 'Запрошена остановка пакета загрузки'
+      })
+    }
+    return { ok: true as const, data: { channelId, cancel_requested: true } }
+  })
+
+  ipcMain.handle('channels:listActiveUploadJobs', () => {
+    return {
+      ok: true as const,
+      data: Array.from(activeUploadJobs.values()).map((job) => ({
+        channelId: job.channelId,
+        startedAt: job.startedAtIso,
+        cancel_requested: job.cancelRequested
+      }))
     }
   })
 
@@ -1792,6 +2160,8 @@ export function registerIpcHandlers(): void {
         publish_mode?: 'manual' | 'scheduled'
         schedule_start_at?: string | null
         schedule_videos_per_day?: number
+        schedule_window_start_mins?: number
+        schedule_window_end_mins?: number
         schedule_window_start_hour?: number
         schedule_window_end_hour?: number
         schedule_randomize_minutes?: number
@@ -1817,8 +2187,25 @@ export function registerIpcHandlers(): void {
         : existing.source_folder_path ?? null
       const mode = payload?.publish_mode === 'scheduled' ? 'scheduled' : 'manual'
       const perDay = Math.max(1, Math.min(24, Number(payload?.schedule_videos_per_day ?? 4)))
-      const startHour = Math.max(0, Math.min(23, Number(payload?.schedule_window_start_hour ?? 9)))
-      const endHour = Math.max(0, Math.min(23, Number(payload?.schedule_window_end_hour ?? 23)))
+      const wStartRaw = Number(payloadRecord.schedule_window_start_mins)
+      const wEndRaw = Number(payloadRecord.schedule_window_end_mins)
+      let windowStartMins = Number.isFinite(wStartRaw)
+        ? Math.max(0, Math.min(1439, Math.floor(wStartRaw)))
+        : Number.NaN
+      let windowEndMins = Number.isFinite(wEndRaw)
+        ? Math.max(0, Math.min(1439, Math.floor(wEndRaw)))
+        : Number.NaN
+      if (!Number.isFinite(windowStartMins)) {
+        windowStartMins = Math.max(0, Math.min(23, Number(payload?.schedule_window_start_hour ?? 9))) * 60
+      }
+      if (!Number.isFinite(windowEndMins)) {
+        windowEndMins = Math.max(0, Math.min(23, Number(payload?.schedule_window_end_hour ?? 23))) * 60 + 59
+      }
+      if (windowEndMins <= windowStartMins) {
+        return { ok: false, error: 'Окно публикации: время «до» должно быть позже «с»' } satisfies CreateResult<never>
+      }
+      const startHour = Math.floor(windowStartMins / 60)
+      const endHour = Math.floor(windowEndMins / 60)
       const randomMins = Math.max(0, Math.min(240, Number(payload?.schedule_randomize_minutes ?? 45)))
       const category = String(payload?.default_category_id ?? '22').trim() || '22'
       const language = String(payload?.default_language ?? 'ru').trim() || 'ru'
@@ -1868,6 +2255,8 @@ export function registerIpcHandlers(): void {
         schedule_videos_per_day: perDay,
         schedule_window_start_hour: startHour,
         schedule_window_end_hour: endHour,
+        schedule_window_start_mins: windowStartMins,
+        schedule_window_end_mins: windowEndMins,
         schedule_randomize_minutes: randomMins,
         schedule_timezone: timezone,
         source_folder_path: sourceFolderPath,
@@ -1908,6 +2297,36 @@ export function registerIpcHandlers(): void {
       return r.filePaths[0]
     }
   )
+
+  ipcMain.handle('fs:countVideosInFolder', async (_event, payload: { folderPath?: string | null }) => {
+    const folderPath = String(payload?.folderPath || '').trim()
+    if (!folderPath) return { ok: true as const, count: 0 }
+    try {
+      const st = await fsp.stat(folderPath)
+      if (!st.isDirectory()) {
+        return { ok: false as const, error: 'Указанный путь не является папкой' }
+      }
+    } catch {
+      return { ok: false as const, error: 'Папка не найдена или недоступна' }
+    }
+    try {
+      const files = await listVideosForUpload(folderPath)
+      return { ok: true as const, count: files.length }
+    } catch (e) {
+      return {
+        ok: false as const,
+        error: e instanceof Error ? e.message : String(e)
+      }
+    }
+  })
+
+  ipcMain.handle('fs:openFolder', async (_event, payload: { folderPath?: string | null }) => {
+    const folderPath = String(payload?.folderPath || '').trim()
+    if (!folderPath) return { ok: false as const, error: 'Пустой путь' }
+    const openErr = await shell.openPath(folderPath)
+    if (openErr) return { ok: false as const, error: openErr }
+    return { ok: true as const }
+  })
 
   ipcMain.handle('db:streamers:list', () => {
     const rows = listStreamers()
@@ -1965,12 +2384,22 @@ export function registerIpcHandlers(): void {
         rtmp_stream_key?: string
         overlay_path?: string | null
         segments_folder_path?: string | null
+        stream_type?: 'casino' | 'white_prewarm'
         stream_mode?: 'random' | 'ordered' | 'single'
         single_segment_path?: string | null
         bumper_video_path?: string | null
+        bumper_overlay_path?: string | null
         bumper_pad_target_sec?: number | null
+        bumper_mute_audio?: number | boolean
+        stream_music_folder_path?: string | null
+        stream_music_volume?: number
+        bumper_music_folder_path?: string | null
+        bumper_music_volume?: number
         video_bitrate_kbps?: number
         video_bitrate_mode?: 'cbr' | 'vbr'
+        stream_output_width?: number
+        stream_output_height?: number
+        stream_video_fps?: number
         ffmpeg_extra_args?: string | null
         youtube_broadcast_id?: string | null
         broadcast_title?: string | null
@@ -2006,6 +2435,9 @@ export function registerIpcHandlers(): void {
       if (payload.segments_folder_path !== undefined) {
         patch.segments_folder_path = sanitizeStreamerFsPathForDb(payload.segments_folder_path ?? null)
       }
+      if (payload.stream_type !== undefined) {
+        patch.stream_type = payload.stream_type === 'white_prewarm' ? 'white_prewarm' : 'casino'
+      }
       if (payload.single_segment_path !== undefined) {
         patch.single_segment_path = sanitizeStreamerFsPathForDb(payload.single_segment_path ?? null)
       }
@@ -2016,6 +2448,9 @@ export function registerIpcHandlers(): void {
       if (payload.bumper_video_path !== undefined) {
         patch.bumper_video_path = sanitizeStreamerFsPathForDb(payload.bumper_video_path ?? null)
       }
+      if (payload.bumper_overlay_path !== undefined) {
+        patch.bumper_overlay_path = sanitizeStreamerFsPathForDb(payload.bumper_overlay_path ?? null)
+      }
       if (payload.bumper_pad_target_sec !== undefined) {
         const raw = payload.bumper_pad_target_sec
         if (raw === null) patch.bumper_pad_target_sec = null
@@ -2023,6 +2458,24 @@ export function registerIpcHandlers(): void {
           const n = Number(raw)
           patch.bumper_pad_target_sec = Number.isFinite(n) ? n : null
         }
+      }
+      if (payload.bumper_mute_audio !== undefined) {
+        const v = payload.bumper_mute_audio
+        patch.bumper_mute_audio = v === true || v === 1 ? 1 : 0
+      }
+      if (payload.stream_music_folder_path !== undefined) {
+        patch.stream_music_folder_path = sanitizeStreamerFsPathForDb(payload.stream_music_folder_path ?? null)
+      }
+      if (payload.stream_music_volume !== undefined) {
+        const n = Math.floor(Number(payload.stream_music_volume))
+        patch.stream_music_volume = Number.isFinite(n) ? Math.max(0, Math.min(200, n)) : 100
+      }
+      if (payload.bumper_music_folder_path !== undefined) {
+        patch.bumper_music_folder_path = sanitizeStreamerFsPathForDb(payload.bumper_music_folder_path ?? null)
+      }
+      if (payload.bumper_music_volume !== undefined) {
+        const n = Math.floor(Number(payload.bumper_music_volume))
+        patch.bumper_music_volume = Number.isFinite(n) ? Math.max(0, Math.min(200, n)) : 100
       }
       if (payload.video_bitrate_kbps !== undefined) {
         const raw = Number(payload.video_bitrate_kbps)
@@ -2033,6 +2486,27 @@ export function registerIpcHandlers(): void {
       }
       if (payload.video_bitrate_mode !== undefined) {
         patch.video_bitrate_mode = payload.video_bitrate_mode === 'vbr' ? 'vbr' : 'cbr'
+      }
+      if (
+        payload.stream_output_width !== undefined ||
+        payload.stream_output_height !== undefined ||
+        payload.stream_video_fps !== undefined
+      ) {
+        const merged = normalizeStreamVideoOutput({
+          stream_output_width:
+            payload.stream_output_width !== undefined
+              ? payload.stream_output_width
+              : existing.stream_output_width,
+          stream_output_height:
+            payload.stream_output_height !== undefined
+              ? payload.stream_output_height
+              : existing.stream_output_height,
+          stream_video_fps:
+            payload.stream_video_fps !== undefined ? payload.stream_video_fps : existing.stream_video_fps
+        })
+        patch.stream_output_width = merged.width
+        patch.stream_output_height = merged.height
+        patch.stream_video_fps = merged.fps
       }
       if (payload.ffmpeg_extra_args !== undefined) patch.ffmpeg_extra_args = payload.ffmpeg_extra_args?.trim() || null
       if (payload.youtube_broadcast_id !== undefined) {
@@ -2141,34 +2615,90 @@ export function registerIpcHandlers(): void {
     return { ok: true as const, data: { streamerId } }
   })
 
+  ipcMain.handle('streamers:openRuntimeConsole', async () => {
+    try {
+      await openStreamRuntimeConsoleWindow()
+      return { ok: true as const }
+    } catch (e) {
+      return { ok: false as const, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('streamers:prebakeMain:start', async (_e, payload: { streamerId: number; forceRebuild?: boolean }) => {
+    const streamerId = Number(payload?.streamerId)
+    if (!Number.isFinite(streamerId) || streamerId < 1) {
+      return { ok: false, error: 'Некорректный streamerId' } satisfies CreateResult<never>
+    }
+    return startStreamerMainPrebake(streamerId, { forceRebuild: payload?.forceRebuild === true })
+  })
+
+  ipcMain.handle('streamers:prebakeMain:status', async (_e, payload: { streamerId: number }) => {
+    const streamerId = Number(payload?.streamerId)
+    if (!Number.isFinite(streamerId) || streamerId < 1) {
+      return { ok: false, error: 'Некорректный streamerId' } satisfies CreateResult<never>
+    }
+    const status = getStreamerMainPrebakeStatus(streamerId)
+    return { ok: true as const, data: status }
+  })
+
+  ipcMain.handle('streamers:prebakeMain:cancel', async (_e, payload: { streamerId: number }) => {
+    const streamerId = Number(payload?.streamerId)
+    if (!Number.isFinite(streamerId) || streamerId < 1) {
+      return { ok: false, error: 'Некорректный streamerId' } satisfies CreateResult<never>
+    }
+    return cancelStreamerMainPrebake(streamerId)
+  })
+
   ipcMain.handle(
     'streamers:openPreview',
     async (
       _e,
       payload: {
         channel_id?: number
+        /** stream — основной контент; bumper — только начальная сцена (тип «Казино»). */
+        preview_focus?: 'stream' | 'bumper'
+        stream_type?: 'casino' | 'white_prewarm'
         stream_mode?: 'random' | 'ordered' | 'single'
         segments_folder_path?: string | null
         single_segment_path?: string | null
         overlay_path?: string | null
         bumper_video_path?: string | null
+        bumper_overlay_path?: string | null
         video_bitrate_kbps?: number
         video_bitrate_mode?: 'cbr' | 'vbr'
+        stream_output_width?: number
+        stream_output_height?: number
+        stream_video_fps?: number
         ffmpeg_extra_args?: string | null
+        streamer_id?: number
       }
     ) => {
       try {
+        const previewFocus = payload?.preview_focus === 'bumper' ? 'bumper' : 'stream'
+        const streamType = payload?.stream_type === 'white_prewarm' ? 'white_prewarm' : 'casino'
+        if (previewFocus === 'bumper' && streamType !== 'casino') {
+          return { ok: false as const, error: 'Предпросмотр начальной сцены доступен только для типа «Казино»' }
+        }
         const mode = payload?.stream_mode === 'ordered' || payload?.stream_mode === 'single' ? payload.stream_mode : 'random'
         const bumperPath = String(payload?.bumper_video_path ?? '').trim()
+        const bumperOverlayPath = String(payload?.bumper_overlay_path ?? '').trim()
         let videoPath = ''
-        if (mode === 'single') {
+        if (previewFocus === 'bumper') {
+          if (!bumperPath && !bumperOverlayPath) {
+            return {
+              ok: false as const,
+              error: 'Выберите хотя бы один источник начальной сцены: видео или оверлей (изображение/GIF/видео)'
+            }
+          }
+          videoPath = bumperPath || bumperOverlayPath
+        } else if (mode === 'single') {
           videoPath = String(payload?.single_segment_path ?? '').trim()
           if (!videoPath) {
-            return { ok: false as const, error: 'Для режима «Один кусок» выберите mp4 файл' }
+            return { ok: false as const, error: 'Выберите видео (файл куска для эфира)' }
           }
         } else {
           const dir = String(payload?.segments_folder_path ?? '').trim()
-          if (!dir) return { ok: false as const, error: 'Выберите папку с кусками' }
+          if (!dir) return { ok: false as const, error: 'Выберите папку с кусками стрима' }
           const segsRaw = await collectSegmentVideos(dir)
           const segs = bumperPath
             ? segsRaw.filter((p) => p.trim().toLowerCase() !== bumperPath.toLowerCase())
@@ -2179,45 +2709,170 @@ export function registerIpcHandlers(): void {
           if (segs.length < 1) return { ok: false as const, error: 'В папке нет видеофайлов' }
           videoPath = segs[0]!
         }
-        const videoFramePath = await captureSingleFrameImage(videoPath, 'video')
+        const overlayForPreview =
+          previewFocus === 'bumper'
+            ? bumperPath
+              ? bumperOverlayPath
+              : ''
+            : streamType === 'white_prewarm'
+              ? ''
+              : String(payload?.overlay_path ?? '').trim()
+        if (previewFocus === 'stream' && streamType === 'casino' && !overlayForPreview) {
+          return { ok: false as const, error: 'Выберите оверлей для стрима' }
+        }
+        let videoFramePath = ''
+        try {
+          videoFramePath = await captureSingleFrameImage(videoPath, 'video')
+        } catch {
+          if (previewFocus === 'bumper' && !bumperPath && existsSync(videoPath)) {
+            videoFramePath = videoPath
+          } else {
+            throw new Error('Не удалось подготовить кадр для предпросмотра')
+          }
+        }
         let overlayFramePath: string | null = null
-        const overlay = String(payload?.overlay_path ?? '').trim()
-        if (overlay) {
+        if (overlayForPreview) {
           try {
-            overlayFramePath = await captureSingleFrameImage(overlay, 'overlay')
+            overlayFramePath = await captureSingleFrameImage(overlayForPreview, 'overlay')
           } catch {
-            overlayFramePath = null
+            overlayFramePath = existsSync(overlayForPreview) ? overlayForPreview : null
           }
         }
         const channelId = Number(payload?.channel_id)
         const ch = Number.isFinite(channelId) && channelId > 0 ? getChannelById(channelId) : null
+        const streamerIdRaw = Number(payload?.streamer_id)
+        const sr =
+          Number.isFinite(streamerIdRaw) && streamerIdRaw > 0 ? getStreamerById(streamerIdRaw) : null
+        const initialLayoutJson =
+          previewFocus === 'bumper'
+            ? (ch?.stream_preview_bumper_layout_json ?? null)
+            : streamType === 'white_prewarm'
+              ? (ch?.stream_preview_layout_white_json ?? null)
+              : (ch?.stream_preview_layout_json ?? null)
+        const payloadForRender = { ...payload, preview_focus: previewFocus }
+        const previewStreamerId = sr?.id ?? null
         await openStreamPreviewWindow({
           videoFramePath,
           overlayFramePath,
-          initialLayoutJson: ch?.stream_preview_layout_json ?? null,
+          initialLayoutJson,
+          previewFocus,
+          streamerId: previewStreamerId,
+          initialStreamMusicVolume: sr ? Number(sr.stream_music_volume ?? 100) : 100,
+          initialBumperMusicVolume: sr ? Number(sr.bumper_music_volume ?? 100) : 100,
+          initialStreamMusicFolder: sr?.stream_music_folder_path ?? null,
+          initialBumperMusicFolder: sr?.bumper_music_folder_path ?? null,
           onSave: (layoutJson) => {
-            if (ch?.id) updateChannelStreamPreviewLayout(ch.id, layoutJson)
+            if (!ch?.id) return
+            if (previewFocus === 'bumper') updateChannelBumperPreviewLayout(ch.id, layoutJson)
+            else updateChannelStreamPreviewLayout(ch.id, layoutJson, streamType)
+            const vol = parsePreviewMusicVolumeFromLayoutJson(layoutJson)
+            if (vol !== null && previewStreamerId != null && previewStreamerId > 0) {
+              if (previewFocus === 'bumper') updateStreamer(previewStreamerId, { bumper_music_volume: vol })
+              else updateStreamer(previewStreamerId, { stream_music_volume: vol })
+              emitDataChanged('streamer_updated')
+            }
+          },
+          onStreamerPatch: (o) => {
+            const rec = o as Record<string, unknown>
+            const id = Number(rec.streamer_id ?? previewStreamerId)
+            if (!Number.isFinite(id) || id < 1) return
+            const patch: Parameters<typeof updateStreamer>[1] = {}
+            if (rec.stream_music_volume !== undefined) {
+              const n = Math.floor(Number(rec.stream_music_volume))
+              if (Number.isFinite(n)) patch.stream_music_volume = Math.max(0, Math.min(200, n))
+            }
+            if (rec.bumper_music_volume !== undefined) {
+              const n = Math.floor(Number(rec.bumper_music_volume))
+              if (Number.isFinite(n)) patch.bumper_music_volume = Math.max(0, Math.min(200, n))
+            }
+            if (rec.stream_music_folder_path !== undefined) {
+              patch.stream_music_folder_path = sanitizeStreamerFsPathForDb(
+                rec.stream_music_folder_path == null ? null : String(rec.stream_music_folder_path)
+              )
+            }
+            if (rec.bumper_music_folder_path !== undefined) {
+              patch.bumper_music_folder_path = sanitizeStreamerFsPathForDb(
+                rec.bumper_music_folder_path == null ? null : String(rec.bumper_music_folder_path)
+              )
+            }
+            if (Object.keys(patch).length > 0) {
+              updateStreamer(id, patch)
+              emitDataChanged('streamer_updated')
+            }
           },
           onRenderMinute: async (layoutJson, onProgress) => {
-            const concatListPath = await buildPreviewRenderConcatList(payload)
-            const materialized = { layoutJson: layoutJson || ch?.stream_preview_layout_json || '', tempFiles: [] as string[] }
+            const concatListPath = await buildPreviewRenderConcatList(payloadForRender)
+            const materialized = { layoutJson: layoutJson || initialLayoutJson || '', tempFiles: [] as string[] }
+            let previewMusicList: string | null = null
+            const srNow =
+              previewStreamerId != null && previewStreamerId > 0
+                ? getStreamerById(previewStreamerId)
+                : null
+            try {
+              const musDir =
+                previewFocus === 'bumper'
+                  ? srNow?.bumper_music_folder_path?.trim()
+                  : srNow?.stream_music_folder_path?.trim()
+              if (musDir) {
+                const tracks = await collectBackgroundMusicFiles(musDir)
+                if (tracks.length > 0) {
+                  previewMusicList = await writeBackgroundMusicShuffledConcatList({
+                    audioPaths: tracks,
+                    repeatBlocks: 80
+                  })
+                }
+              }
+            } catch {
+              previewMusicList = null
+            }
+            let concatHasAudio = false
+            try {
+              concatHasAudio = await ffprobeHasAudioStream(videoPath)
+            } catch {
+              concatHasAudio = false
+            }
+            const musVolFromLayout = parsePreviewMusicVolumeFromLayoutJson(layoutJson || '')
+            const musVolFallback =
+              previewFocus === 'bumper'
+                ? Number(srNow?.bumper_music_volume ?? 100)
+                : Number(srNow?.stream_music_volume ?? 100)
+            const musVol = musVolFromLayout !== null ? musVolFromLayout : musVolFallback
             try {
               const rendersDir = join(process.cwd(), 'renders')
               await fsp.mkdir(rendersDir, { recursive: true })
               const outPath = join(rendersDir, `preview-render-${Date.now()}.mp4`)
               const bitrateKbps = Math.max(200, Math.min(50000, Math.floor(Number(payload?.video_bitrate_kbps) || 6000)))
               const bitrateMode = payload?.video_bitrate_mode === 'vbr' ? 'vbr' : 'cbr'
-              const hydrated = await materializeLayoutDataUrlSources(layoutJson || ch?.stream_preview_layout_json || '')
+              const hydrated = await materializeLayoutDataUrlSources(layoutJson || initialLayoutJson || '')
               materialized.layoutJson = hydrated.layoutJson
               materialized.tempFiles = hydrated.tempFiles
+              const overlayForRender =
+                previewFocus === 'bumper'
+                  ? bumperPath
+                    ? bumperOverlayPath || null
+                    : null
+                  : streamType === 'white_prewarm'
+                    ? null
+                    : String(payload?.overlay_path ?? '').trim() || null
+              const renderVo = normalizeStreamVideoOutput({
+                stream_output_width: payload?.stream_output_width ?? srNow?.stream_output_width ?? null,
+                stream_output_height: payload?.stream_output_height ?? srNow?.stream_output_height ?? null,
+                stream_video_fps: payload?.stream_video_fps ?? srNow?.stream_video_fps ?? null
+              })
               const streamArgs = buildFfmpegStreamArgs({
                 concatListPath,
                 outputRtmpUrl: 'rtmp://127.0.0.1/live/preview-render',
-                overlayPath: String(payload?.overlay_path ?? '').trim() || null,
+                overlayPath: overlayForRender,
                 videoBitrateKbps: bitrateKbps,
                 videoBitrateMode: bitrateMode,
                 extraArgs: payload?.ffmpeg_extra_args?.trim() || null,
-                streamPreviewLayoutJson: materialized.layoutJson || null
+                streamPreviewLayoutJson: materialized.layoutJson || null,
+                streamMusicConcatListPath: previewMusicList,
+                streamMusicVolumePercent: musVol,
+                concatVideoHasAudio: concatHasAudio,
+                outputWidth: renderVo.width,
+                outputHeight: renderVo.height,
+                outputFps: renderVo.fps
               })
               const renderArgs = toMp4FileArgs(streamArgs, outPath, 60)
               await renderMinuteWithProgress({ args: renderArgs, totalSec: 60, onProgress })
@@ -2228,6 +2883,7 @@ export function registerIpcHandlers(): void {
                 await unlinkQuiet(p)
               }
               await unlinkQuiet(concatListPath)
+              await unlinkQuiet(previewMusicList ?? '')
             }
           }
         })
@@ -2408,6 +3064,7 @@ export function registerIpcHandlers(): void {
       action_type: 'app_started',
       message: 'Приложение запущено'
     })
+    void runStartupOAuthChecksForAllChannels()
     return { ok: true as const }
   })
 }

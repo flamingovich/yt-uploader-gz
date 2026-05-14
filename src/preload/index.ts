@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+type OauthStartupPayload =
+  | { phase: 'start' }
+  | { phase: 'progress'; channelId: number; index: number; total: number }
+  | { phase: 'end' }
+
 const api = {
   bootstrap: (): Promise<{ ok: true }> => ipcRenderer.invoke('app:bootstrap'),
   onDataChanged: (cb: (payload: { actionType: string; at: number }) => void): (() => void) => {
@@ -7,12 +12,25 @@ const api = {
     ipcRenderer.on('app:dataChanged', handler)
     return () => ipcRenderer.off('app:dataChanged', handler)
   },
+  onOAuthStartupCheck: (cb: (payload: OauthStartupPayload) => void): (() => void) => {
+    const handler = (_event: unknown, payload: OauthStartupPayload) => cb(payload)
+    ipcRenderer.on('app:oauthStartupCheck', handler)
+    return () => ipcRenderer.off('app:oauthStartupCheck', handler)
+  },
   openExternalUrl: (url: string) =>
     ipcRenderer.invoke('app:openExternalUrl', { url }) as Promise<{ ok: true } | { ok: false; error: string }>,
   dialog: {
     openDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:openDirectory'),
     openFile: (payload?: { filters?: { name: string; extensions: string[] }[] }): Promise<string | null> =>
       ipcRenderer.invoke('dialog:openFile', payload)
+  },
+  fs: {
+    countVideosInFolder: (payload: { folderPath: string }) =>
+      ipcRenderer.invoke('fs:countVideosInFolder', payload) as Promise<
+        { ok: true; count: number } | { ok: false; error: string }
+      >,
+    openFolder: (payload: { folderPath: string }) =>
+      ipcRenderer.invoke('fs:openFolder', payload) as Promise<{ ok: true } | { ok: false; error: string }>
   },
   proxy: {
     check: (payload: {
@@ -72,6 +90,8 @@ const api = {
       publish_mode?: 'manual' | 'scheduled'
       schedule_start_at?: string | null
       schedule_videos_per_day?: number
+      schedule_window_start_mins?: number
+      schedule_window_end_mins?: number
       schedule_window_start_hour?: number
       schedule_window_end_hour?: number
       schedule_randomize_minutes?: number
@@ -85,11 +105,14 @@ const api = {
     oauthBeginManualInAds: (payload: { channelId: number }) =>
       ipcRenderer.invoke('channels:oauthBeginManualInAds', payload),
     oauthCheck: (payload: { channelId: number }) => ipcRenderer.invoke('channels:oauthCheck', payload),
+    oauthProbe: (payload: { channelId: number }) => ipcRenderer.invoke('channels:oauthProbe', payload),
     syncProxyFromAds: (payload: { channelId: number }) => ipcRenderer.invoke('channels:syncProxyFromAds', payload),
     oauthWaitManual: (payload: { flowId: string; timeoutMs?: number }) => ipcRenderer.invoke('channels:oauthWaitManual', payload),
     oauthFinishManual: (payload: { flowId: string; callbackUrl: string }) =>
       ipcRenderer.invoke('channels:oauthFinishManual', payload),
     uploadTestVideo: (payload: { channelId: number }) => ipcRenderer.invoke('channels:uploadTestVideo', payload),
+    cancelUpload: (payload: { channelId: number }) => ipcRenderer.invoke('channels:cancelUpload', payload),
+    listActiveUploadJobs: () => ipcRenderer.invoke('channels:listActiveUploadJobs'),
     listStreamers: () => ipcRenderer.invoke('db:streamers:list'),
     getStreamer: (id: number) => ipcRenderer.invoke('db:streamers:get', id),
     createStreamer: (payload: { name: string; channel_id: number; proxy_id?: number | null }) =>
@@ -103,12 +126,22 @@ const api = {
       rtmp_stream_key?: string
       overlay_path?: string | null
       segments_folder_path?: string | null
+      stream_type?: 'casino' | 'white_prewarm'
       stream_mode?: 'random' | 'ordered' | 'single'
       single_segment_path?: string | null
       bumper_video_path?: string | null
+      bumper_overlay_path?: string | null
       bumper_pad_target_sec?: number | null
+      bumper_mute_audio?: number | boolean
+      stream_music_folder_path?: string | null
+      stream_music_volume?: number
+      bumper_music_folder_path?: string | null
+      bumper_music_volume?: number
       video_bitrate_kbps?: number
       video_bitrate_mode?: 'cbr' | 'vbr'
+      stream_output_width?: number
+      stream_output_height?: number
+      stream_video_fps?: number
       ffmpeg_extra_args?: string | null
       youtube_broadcast_id?: string | null
       broadcast_title?: string | null
@@ -127,16 +160,28 @@ const api = {
   streamers: {
     start: (payload: { streamerId: number }) => ipcRenderer.invoke('streamers:start', payload),
     stop: (payload: { streamerId: number }) => ipcRenderer.invoke('streamers:stop', payload),
+    openRuntimeConsole: () => ipcRenderer.invoke('streamers:openRuntimeConsole'),
+    prebakeMainStart: (payload: { streamerId: number; forceRebuild?: boolean }) =>
+      ipcRenderer.invoke('streamers:prebakeMain:start', payload),
+    prebakeMainStatus: (payload: { streamerId: number }) => ipcRenderer.invoke('streamers:prebakeMain:status', payload),
+    prebakeMainCancel: (payload: { streamerId: number }) => ipcRenderer.invoke('streamers:prebakeMain:cancel', payload),
     openPreview: (payload: {
       channel_id?: number
+      preview_focus?: 'stream' | 'bumper'
+      stream_type?: 'casino' | 'white_prewarm'
       stream_mode?: 'random' | 'ordered' | 'single'
       segments_folder_path?: string | null
       single_segment_path?: string | null
       overlay_path?: string | null
       bumper_video_path?: string | null
+      bumper_overlay_path?: string | null
       video_bitrate_kbps?: number
       video_bitrate_mode?: 'cbr' | 'vbr'
+      stream_output_width?: number
+      stream_output_height?: number
+      stream_video_fps?: number
       ffmpeg_extra_args?: string | null
+      streamer_id?: number
     }) => ipcRenderer.invoke('streamers:openPreview', payload),
     applyBroadcastMeta: (payload: {
       streamerId: number

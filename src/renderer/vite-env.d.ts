@@ -20,6 +20,8 @@ type ChannelListItem = {
   schedule_videos_per_day: number
   schedule_window_start_hour: number
   schedule_window_end_hour: number
+  schedule_window_start_mins: number
+  schedule_window_end_mins: number
   schedule_randomize_minutes: number
   schedule_timezone: string
   last_uploaded_at: string | null
@@ -119,10 +121,24 @@ declare global {
     electronAPI: {
       bootstrap(): Promise<{ ok: true }>
       onDataChanged(cb: (payload: { actionType: string; at: number }) => void): () => void
+      onOAuthStartupCheck(
+        cb: (
+          payload:
+            | { phase: 'start' }
+            | { phase: 'progress'; channelId: number; index: number; total: number }
+            | { phase: 'end' }
+        ) => void
+      ): () => void
       openExternalUrl(url: string): Promise<{ ok: true } | { ok: false; error: string }>
       dialog: {
         openDirectory(): Promise<string | null>
         openFile(payload?: { filters?: { name: string; extensions: string[] }[] }): Promise<string | null>
+      }
+      fs: {
+        countVideosInFolder(payload: {
+          folderPath: string
+        }): Promise<{ ok: true; count: number } | { ok: false; error: string }>
+        openFolder(payload: { folderPath: string }): Promise<{ ok: true } | { ok: false; error: string }>
       }
       proxy: {
         check(payload: {
@@ -193,6 +209,8 @@ declare global {
           publish_mode?: 'manual' | 'scheduled'
           schedule_start_at?: string | null
           schedule_videos_per_day?: number
+          schedule_window_start_mins?: number
+          schedule_window_end_mins?: number
           schedule_window_start_hour?: number
           schedule_window_end_hour?: number
           schedule_randomize_minutes?: number
@@ -217,6 +235,7 @@ declare global {
           | CreateResult<{ youtube_channel_id: string; channel_title: string }>
           | { ok: false; error: string }
         >
+        oauthProbe(payload: { channelId: number }): Promise<CreateResult<Record<string, never>> | { ok: false; error: string }>
         syncProxyFromAds(payload: { channelId: number }): Promise<
           | CreateResult<{ mode: 'imported' | 'linked_existing' | 'no_proxy'; proxy_id: number | null; summary: string }>
           | { ok: false; error: string }
@@ -240,6 +259,14 @@ declare global {
             }>
           | { ok: false; error: string }
         >
+        cancelUpload(payload: { channelId: number }): Promise<
+          | CreateResult<{ channelId: number; cancel_requested: true }>
+          | { ok: false; error: string }
+        >
+        listActiveUploadJobs(): Promise<
+          | CreateResult<Array<{ channelId: number; startedAt: string; cancel_requested: boolean }>>
+          | { ok: false; error: string }
+        >
         listStreamers(): Promise<StreamerListItem[]>
         getStreamer(id: number): Promise<StreamerDetailRow | null>
         createStreamer(payload: {
@@ -256,12 +283,22 @@ declare global {
           rtmp_stream_key?: string
           overlay_path?: string | null
           segments_folder_path?: string | null
+          stream_type?: 'casino' | 'white_prewarm'
           stream_mode?: 'random' | 'ordered' | 'single'
           single_segment_path?: string | null
           bumper_video_path?: string | null
+          bumper_overlay_path?: string | null
           bumper_pad_target_sec?: number | null
+          bumper_mute_audio?: number | boolean
+          stream_music_folder_path?: string | null
+          stream_music_volume?: number
+          bumper_music_folder_path?: string | null
+          bumper_music_volume?: number
           video_bitrate_kbps?: number
           video_bitrate_mode?: 'cbr' | 'vbr'
+          stream_output_width?: number
+          stream_output_height?: number
+          stream_video_fps?: number
           ffmpeg_extra_args?: string | null
           youtube_broadcast_id?: string | null
           broadcast_title?: string | null
@@ -280,16 +317,37 @@ declare global {
       streamers: {
         start(payload: { streamerId: number }): Promise<CreateResult<Record<string, never>>>
         stop(payload: { streamerId: number }): Promise<CreateResult<{ streamerId: number }>>
+        openRuntimeConsole(): Promise<{ ok: true } | { ok: false; error: string }>
+        prebakeMainStart(payload: { streamerId: number; forceRebuild?: boolean }): Promise<CreateResult<{ started: true }>>
+        prebakeMainStatus(payload: { streamerId: number }): Promise<
+          | CreateResult<{
+              phase: 'idle' | 'running' | 'done' | 'error'
+              percent: number
+              message: string
+              outputPath: string | null
+              cacheHit: boolean
+              updatedAt: number
+            }>
+          | { ok: false; error: string }
+        >
+        prebakeMainCancel(payload: { streamerId: number }): Promise<CreateResult<{ cancelled: true }>>
         openPreview(payload: {
           channel_id?: number
+          preview_focus?: 'stream' | 'bumper'
+          stream_type?: 'casino' | 'white_prewarm'
           stream_mode?: 'random' | 'ordered' | 'single'
           segments_folder_path?: string | null
           single_segment_path?: string | null
           overlay_path?: string | null
           bumper_video_path?: string | null
+          bumper_overlay_path?: string | null
           video_bitrate_kbps?: number
           video_bitrate_mode?: 'cbr' | 'vbr'
+          stream_output_width?: number
+          stream_output_height?: number
+          stream_video_fps?: number
           ffmpeg_extra_args?: string | null
+          streamer_id?: number
         }): Promise<{ ok: true } | { ok: false; error: string }>
         applyBroadcastMeta(payload: {
           streamerId: number
@@ -338,12 +396,22 @@ type StreamerDetailRow = {
   rtmp_stream_key: string
   overlay_path: string | null
   segments_folder_path: string | null
+  stream_type: 'casino' | 'white_prewarm'
   stream_mode: 'random' | 'ordered' | 'single'
   single_segment_path: string | null
   bumper_video_path: string | null
+  bumper_overlay_path: string | null
   bumper_pad_target_sec: number | null
+  bumper_mute_audio: number
+  stream_music_folder_path: string | null
+  stream_music_volume: number
+  bumper_music_folder_path: string | null
+  bumper_music_volume: number
   video_bitrate_kbps: number
   video_bitrate_mode: 'cbr' | 'vbr'
+  stream_output_width: number
+  stream_output_height: number
+  stream_video_fps: number
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null
@@ -373,12 +441,22 @@ type StreamerListItem = {
   rtmp_ingest_url: string
   overlay_path: string | null
   segments_folder_path: string | null
+  stream_type: 'casino' | 'white_prewarm'
   stream_mode: 'random' | 'ordered' | 'single'
   single_segment_path: string | null
   bumper_video_path: string | null
+  bumper_overlay_path: string | null
   bumper_pad_target_sec: number | null
+  bumper_mute_audio: number
+  stream_music_folder_path: string | null
+  stream_music_volume: number
+  bumper_music_folder_path: string | null
+  bumper_music_volume: number
   video_bitrate_kbps: number
   video_bitrate_mode: 'cbr' | 'vbr'
+  stream_output_width: number
+  stream_output_height: number
+  stream_video_fps: number
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null
@@ -399,6 +477,8 @@ type StreamerListItem = {
   created_at: string
   updated_at: string
   channel_title: string | null
+  channel_ads_profile_id: string | null
+  channel_oauth_status: 'unknown' | 'ok' | 'invalid'
   proxy_name: string | null
   rtmp_stream_key_masked: string
   /** Только пока сессия стрима активна: суммарный битрейт из ffmpeg (kbits/s). */
