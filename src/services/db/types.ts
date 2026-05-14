@@ -53,6 +53,8 @@ export interface ChannelRow {
   schedule_videos_per_day: number
   schedule_window_start_hour: number
   schedule_window_end_hour: number
+  schedule_window_start_mins: number
+  schedule_window_end_mins: number
   schedule_randomize_minutes: number
   schedule_timezone: string
   oauth_refresh_token: string | null
@@ -60,6 +62,10 @@ export interface ChannelRow {
   oauth_status: 'unknown' | 'ok' | 'invalid'
   /** Сохраненный пресет предпросмотра стрима (JSON). */
   stream_preview_layout_json: string | null
+  /** Сохраненный пресет предпросмотра для типа «Прогрев белым». */
+  stream_preview_layout_white_json: string | null
+  /** Пресет предпросмотра начальной сцены (бампер), тип «Казино». */
+  stream_preview_bumper_layout_json: string | null
   token_expires_at: string | null
   source_folder_path: string | null
   is_enabled: number
@@ -112,17 +118,37 @@ export interface StreamerRow {
   rtmp_stream_key: string
   overlay_path: string | null
   segments_folder_path: string | null
+  /** Тип стрима: casino = обычный конвейер, white_prewarm = один выбранный кусок в цикле. */
+  stream_type: 'casino' | 'white_prewarm'
   /** Режим плейлиста стрима: random = shuffle, ordered = по порядку, single = один кусок. */
   stream_mode: 'random' | 'ordered' | 'single'
   /** Явно выбранный файл для режима single. */
   single_segment_path: string | null
   bumper_video_path: string | null
+  /** Оверлей только для начальной сцены (растровое изображение / GIF или зацикленное видео). */
+  bumper_overlay_path: string | null
   /** NULL = авто; 0 = один проигрыв; >0 = зациклить до N сек. */
   bumper_pad_target_sec: number | null
+  /** 1 = не отправлять звук начальной сцены в RTMP. */
+  bumper_mute_audio: number
+  /** Папка с треками для фона основного стрима (случайный порядок). */
+  stream_music_folder_path: string | null
+  /** Громкость фона стрима, 0–200 (% от исходной громкости файлов). */
+  stream_music_volume: number
+  /** Папка с треками для фона начальной сцены. */
+  bumper_music_folder_path: string | null
+  /** Громкость фона начальной сцены, 0–200. */
+  bumper_music_volume: number
   /** Целевой видео-битрейт (kbps). */
   video_bitrate_kbps: number
   /** Режим контроля битрейта видеокодека. */
   video_bitrate_mode: 'cbr' | 'vbr'
+  /** Ширина выхода RTMP: 720, 900 или 1080. */
+  stream_output_width: number
+  /** Высота выхода RTMP: 1280, 1600 или 1920. */
+  stream_output_height: number
+  /** FPS выхода: 24, 30, 50 или 60. */
+  stream_video_fps: number
   ffmpeg_extra_args: string | null
   youtube_broadcast_id: string | null
   broadcast_title: string | null

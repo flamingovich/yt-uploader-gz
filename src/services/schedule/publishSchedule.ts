@@ -1,18 +1,16 @@
 /**
  * Расчёт времён отложенной публикации: якорь по schedule_start_at (полная дата+время),
- * равномерные слоты в окне [windowStartHour, windowEndHour], джиттер ±randomizeMinutes
- * с прижатием к окну, чтобы не уезжать в 08:xx при окне с 9:00.
+ * равномерные слоты в окне [windowStartMins, windowEndMins] (минуты от полуночи, конец включительно),
+ * джиттер ±randomizeMinutes с прижатием к окну.
  */
 
 export function clampDateToPublicationWindow(
   d: Date,
-  windowStartHour: number,
-  windowEndHour: number
+  windowStartMins: number,
+  windowEndMins: number
 ): Date {
-  const startH = Math.max(0, Math.min(23, windowStartHour))
-  const endH = Math.max(startH + 1, Math.min(23, windowEndHour))
-  const w0 = startH * 60
-  const w1 = endH * 60 + 59
+  const w0 = Math.max(0, Math.min(1439, Math.floor(windowStartMins)))
+  const w1 = Math.max(w0, Math.min(1439, Math.floor(windowEndMins)))
   const out = new Date(d)
   let mins = out.getHours() * 60 + out.getMinutes()
   if (mins < w0) {
@@ -38,26 +36,36 @@ function parseAnchorIso(baseIso: string | null): Date | null {
   return Number.isNaN(d.getTime()) ? null : d
 }
 
+function setTimeFromMinsOnDate(t: Date, minsFromMidnight: number): void {
+  const m = Math.max(0, Math.min(1439, Math.floor(minsFromMidnight)))
+  t.setHours(0, 0, 0, 0)
+  t.setHours(Math.floor(m / 60), m % 60, 0, 0)
+}
+
 export function collectFuturePublishCandidates(input: {
   baseIso: string | null
   videosPerDay: number
-  windowStartHour: number
-  windowEndHour: number
+  windowStartMins: number
+  windowEndMins: number
   randomizeMinutes: number
   minFuture: Date
   /** Сколько первых подходящих слотов собрать (достаточно для превью или futureSlotIndex+1). */
   needCount: number
   mode: 'preview' | 'upload'
 }): Date[] {
-  const startH = Math.max(0, Math.min(23, input.windowStartHour))
-  const endH = Math.max(startH + 1, Math.min(23, input.windowEndHour))
-  const spanMinutes = (endH - startH) * 60
+  let w0 = Math.max(0, Math.min(1439, Math.floor(input.windowStartMins)))
+  let w1 = Math.max(0, Math.min(1439, Math.floor(input.windowEndMins)))
+  if (w1 <= w0) {
+    w1 = Math.min(1439, w0 + 59)
+  }
+  const spanMinutes = Math.max(1, w1 - w0)
   const perDay = Math.max(1, Math.min(24, input.videosPerDay))
   const slotMinutes = Math.max(1, Math.floor(spanMinutes / perDay))
   const rnd = Math.max(0, Math.min(240, input.randomizeMinutes))
 
   const anchor = parseAnchorIso(input.baseIso)
   const hasAnchor = anchor !== null
+  const anchorTs = hasAnchor ? anchor!.getTime() : Number.NEGATIVE_INFINITY
   const seedDay = new Date(hasAnchor ? anchor! : input.minFuture)
   seedDay.setHours(0, 0, 0, 0)
 
@@ -71,20 +79,21 @@ export function collectFuturePublishCandidates(input: {
       if (hasAnchor && dayShift === 0) {
         const anchorM = anchor!.getHours() * 60 + anchor!.getMinutes()
         const candidateMinutes = anchorM + inDay * slotMinutes
-        // Не допускаем "перелив" слотов первого дня на следующий календарный день:
-        // именно он порождал лишние слоты/дубли типа 09:00, 09:00, 09:12.
-        if (candidateMinutes > endH * 60 + 59) break
-        t.setHours(0, 0, 0, 0)
-        t.setMinutes(candidateMinutes)
+        if (candidateMinutes > w1) break
+        setTimeFromMinsOnDate(t, candidateMinutes)
       } else {
-        t.setHours(startH, 0, 0, 0)
-        t.setMinutes(inDay * slotMinutes)
+        const baseM = w0 + inDay * slotMinutes
+        setTimeFromMinsOnDate(t, baseM)
       }
       if (rnd > 0) {
         t.setMinutes(t.getMinutes() + jitterDelta(serial, rnd, input.mode))
       }
       serial += 1
-      const clamped = clampDateToPublicationWindow(t, startH, endH)
+      const clamped = clampDateToPublicationWindow(t, w0, w1)
+      // При якоре от очереди начинаем строго ПОСЛЕ него, чтобы не дублировать уже занятый слот.
+      if (hasAnchor && clamped.getTime() <= anchorTs) {
+        continue
+      }
       const ts = clamped.getTime()
       if (clamped >= input.minFuture && !seen.has(ts)) {
         seen.add(ts)
@@ -99,8 +108,8 @@ export function computeScheduledPublishAtIso(input: {
   baseIso: string | null
   futureSlotIndex: number
   videosPerDay: number
-  windowStartHour: number
-  windowEndHour: number
+  windowStartMins: number
+  windowEndMins: number
   randomizeMinutes: number
   now?: Date
 }): string {
@@ -110,8 +119,8 @@ export function computeScheduledPublishAtIso(input: {
   const candidates = collectFuturePublishCandidates({
     baseIso: input.baseIso,
     videosPerDay: input.videosPerDay,
-    windowStartHour: input.windowStartHour,
-    windowEndHour: input.windowEndHour,
+    windowStartMins: input.windowStartMins,
+    windowEndMins: input.windowEndMins,
     randomizeMinutes: input.randomizeMinutes,
     minFuture,
     needCount: need,

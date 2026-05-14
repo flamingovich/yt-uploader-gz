@@ -14,6 +14,14 @@ body {
   color: #e5e5e5;
 }
 
+/* Вместо яркого системного синего focus (macOS / Chromium): тонкая нейтральная подсветка */
+input:focus-visible:not([type='checkbox']):not([type='radio']),
+select:focus-visible,
+textarea:focus-visible {
+  outline: none !important;
+  box-shadow: 0 0 0 1px rgba(115, 115, 115, 0.38);
+}
+
 /* Scrollbars: match industrial theme (Firefox + Chromium / Electron) */
 * {
   scrollbar-width: thin;

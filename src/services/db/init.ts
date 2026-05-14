@@ -17,13 +17,21 @@ import {
   migrateToV13IfNeeded,
   migrateToV14IfNeeded,
   migrateToV15IfNeeded,
-  migrateToV16IfNeeded
+  migrateToV16IfNeeded,
+  migrateToV17IfNeeded,
+  migrateToV18IfNeeded,
+  migrateToV19IfNeeded,
+  migrateToV20IfNeeded,
+  migrateToV21IfNeeded,
+  migrateToV22IfNeeded,
+  migrateToV23IfNeeded,
+  migrateToV24IfNeeded
 } from './migrate'
 
 let db: Database.Database | null = null
 
 /** Целевая версия миграций (см. migrate.ts). */
-export const SCHEMA_VERSION = 16
+export const SCHEMA_VERSION = 24
 
 export function getDb(): Database.Database {
   if (!db) {
@@ -60,6 +68,14 @@ export function initDatabase(dbPath: string): Database.Database {
   migrateToV14IfNeeded(instance)
   migrateToV15IfNeeded(instance)
   migrateToV16IfNeeded(instance)
+  migrateToV17IfNeeded(instance)
+  migrateToV18IfNeeded(instance)
+  migrateToV19IfNeeded(instance)
+  migrateToV20IfNeeded(instance)
+  migrateToV21IfNeeded(instance)
+  migrateToV22IfNeeded(instance)
+  migrateToV23IfNeeded(instance)
+  migrateToV24IfNeeded(instance)
   if (!hasMigration(instance, SCHEMA_VERSION)) {
     instance.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(SCHEMA_VERSION)
   }

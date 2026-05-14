@@ -89,8 +89,11 @@ export function listChannels(): ChannelListItem[] {
       `SELECT c.id, c.proxy_id, c.oauth_profile_id, c.ads_profile_id, c.ads_profile_name, c.youtube_channel_id, c.channel_title,
               c.default_description, c.default_tags, c.made_for_kids, c.default_category_id, c.default_language, c.publish_mode,
               c.schedule_start_at, c.schedule_videos_per_day, c.schedule_window_start_hour,
-              c.schedule_window_end_hour, c.schedule_randomize_minutes, c.schedule_timezone,
-              c.source_folder_path, c.is_enabled, c.upload_cooldown_seconds, c.oauth_status, c.stream_preview_layout_json, c.created_at, c.updated_at, p.label AS oauth_profile_label,
+              c.schedule_window_end_hour,
+              COALESCE(c.schedule_window_start_mins, c.schedule_window_start_hour * 60) AS schedule_window_start_mins,
+              COALESCE(c.schedule_window_end_mins, c.schedule_window_end_hour * 60 + 59) AS schedule_window_end_mins,
+              c.schedule_randomize_minutes, c.schedule_timezone,
+              c.source_folder_path, c.is_enabled, c.upload_cooldown_seconds, c.oauth_status, c.stream_preview_layout_json, c.stream_preview_layout_white_json, c.created_at, c.updated_at, p.label AS oauth_profile_label,
               (
                 SELECT q.completed_at
                 FROM upload_queue q
@@ -162,6 +165,8 @@ export function updateChannelPublishingSettings(input: {
   schedule_videos_per_day: number
   schedule_window_start_hour: number
   schedule_window_end_hour: number
+  schedule_window_start_mins: number
+  schedule_window_end_mins: number
   schedule_randomize_minutes: number
   schedule_timezone: string
   source_folder_path: string | null
@@ -180,6 +185,8 @@ export function updateChannelPublishingSettings(input: {
            schedule_videos_per_day = @schedule_videos_per_day,
            schedule_window_start_hour = @schedule_window_start_hour,
            schedule_window_end_hour = @schedule_window_end_hour,
+           schedule_window_start_mins = @schedule_window_start_mins,
+           schedule_window_end_mins = @schedule_window_end_mins,
            schedule_randomize_minutes = @schedule_randomize_minutes,
            schedule_timezone = @schedule_timezone,
            source_folder_path = @source_folder_path,
@@ -201,6 +208,8 @@ export function updateChannelPublishingSettings(input: {
       schedule_videos_per_day: input.schedule_videos_per_day,
       schedule_window_start_hour: input.schedule_window_start_hour,
       schedule_window_end_hour: input.schedule_window_end_hour,
+      schedule_window_start_mins: input.schedule_window_start_mins,
+      schedule_window_end_mins: input.schedule_window_end_mins,
       schedule_randomize_minutes: input.schedule_randomize_minutes,
       schedule_timezone: input.schedule_timezone.trim() || 'Europe/Moscow',
       source_folder_path: input.source_folder_path?.trim() || null,
@@ -300,11 +309,30 @@ export function updateChannelOAuthData(input: {
     })
 }
 
-export function updateChannelStreamPreviewLayout(channelId: number, layoutJson: string | null): void {
+export function updateChannelStreamPreviewLayout(
+  channelId: number,
+  layoutJson: string | null,
+  type: 'casino' | 'white_prewarm' = 'casino'
+): void {
+  const col = type === 'white_prewarm' ? 'stream_preview_layout_white_json' : 'stream_preview_layout_json'
   getDb()
     .prepare(
       `UPDATE channels
-       SET stream_preview_layout_json = @layout,
+       SET ${col} = @layout,
+           updated_at = datetime('now')
+       WHERE id = @channel_id`
+    )
+    .run({
+      channel_id: channelId,
+      layout: layoutJson
+    })
+}
+
+export function updateChannelBumperPreviewLayout(channelId: number, layoutJson: string | null): void {
+  getDb()
+    .prepare(
+      `UPDATE channels
+       SET stream_preview_bumper_layout_json = @layout,
            updated_at = datetime('now')
        WHERE id = @channel_id`
     )

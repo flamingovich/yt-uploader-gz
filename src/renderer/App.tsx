@@ -5,6 +5,7 @@ import {
   ScrollText,
   Server,
   Settings,
+  Timer,
   Video
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -68,9 +69,17 @@ function renderBody(active: NavId): JSX.Element {
 export function App(): JSX.Element {
   const [active, setActive] = useState<NavId>('overview')
   const [ready, setReady] = useState(false)
+  const [oauthStartupRunning, setOauthStartupRunning] = useState(false)
 
   useEffect(() => {
+    const off = window.electronAPI.onOAuthStartupCheck((payload) => {
+      if (payload.phase === 'start') setOauthStartupRunning(true)
+      if (payload.phase === 'end') setOauthStartupRunning(false)
+    })
     void window.electronAPI.bootstrap().finally(() => setReady(true))
+    return () => {
+      off()
+    }
   }, [])
 
   const current = nav.find((n) => n.id === active) ?? nav[0]
@@ -106,7 +115,18 @@ export function App(): JSX.Element {
                 ].join(' ')}
               >
                 <Icon className="h-4 w-4 shrink-0" strokeWidth={1.5} />
-                <span>{item.label}</span>
+                <span className="flex min-w-0 flex-1 items-center justify-between gap-2">
+                  <span className="truncate">{item.label}</span>
+                  {item.id === 'channels' && oauthStartupRunning ? (
+                    <span className="inline-flex shrink-0" title="Проверка OAuth у каналов…">
+                      <Timer
+                        className="h-3.5 w-3.5 text-industrial-dim animate-pulse"
+                        strokeWidth={1.5}
+                        aria-hidden
+                      />
+                    </span>
+                  ) : null}
+                </span>
               </button>
             )
           })}

@@ -25,17 +25,15 @@ export default {
           dim: '#737373'
         }
       },
-      fontFamily: {
-        sans: [
-          'ui-sans-serif',
-          'system-ui',
-          'Segoe UI',
-          'Roboto',
-          'Helvetica Neue',
-          'Arial',
-          'sans-serif'
-        ]
-      }
+      animation: {
+        shimmer: 'shimmer 2.2s ease-in-out infinite'
+      },
+      keyframes: {
+        shimmer: {
+          '0%': { transform: 'translateX(-120%)' },
+          '100%': { transform: 'translateX(120%)' }
+        }
+      },
     }
   },
   plugins: []

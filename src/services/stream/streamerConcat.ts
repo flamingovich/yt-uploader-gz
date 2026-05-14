@@ -11,6 +11,7 @@ import { getMediaDurationSeconds } from './ffprobe'
 const execFile = promisify(execFileCallback)
 
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm'])
+const BG_MUSIC_EXT = new Set(['.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus'])
 const NATURAL_COLLATOR = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' })
 
 /**
@@ -357,6 +358,59 @@ export async function writeMusicRepeatConcatList(input: {
   }
   const body = `${lines.join('\n')}\n`
   const name = `ytu-mc-music-${randomBytes(8).toString('hex')}.txt`
+  const path = join(tmpdir(), name)
+  await fsp.writeFile(path, body, 'utf8')
+  return path
+}
+
+/** Рекурсивно собирает аудио для фона стрима (порядок воспроизведения — случайный в concat-листе). */
+export async function collectBackgroundMusicFiles(rootFolder: string): Promise<string[]> {
+  const root = resolve(normalizeFsPath(rootFolder))
+  const out: string[] = []
+  async function walk(dir: string): Promise<void> {
+    let entries: Awaited<ReturnType<typeof fsp.readdir>> | undefined
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name.toLowerCase() === 'uploaded') continue
+        await walk(full)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const dot = entry.name.lastIndexOf('.')
+      const ext = dot === -1 ? '' : entry.name.slice(dot).toLowerCase()
+      if (BG_MUSIC_EXT.has(ext)) out.push(resolve(full))
+    }
+  }
+  await walk(root)
+  return out.sort((a, b) => NATURAL_COLLATOR.compare(a, b))
+}
+
+/**
+ * Concat-лист: несколько раз подряд перемешанный набор треков (для `-stream_loop -1 -f concat`).
+ */
+export async function writeBackgroundMusicShuffledConcatList(input: {
+  audioPaths: string[]
+  repeatBlocks?: number
+}): Promise<string> {
+  const paths = input.audioPaths.map((p) => resolve(normalizeFsPath(p)))
+  if (paths.length < 1) throw new Error('Нет аудиофайлов для фона')
+  const repeatBlocks = Math.max(1, Math.min(500, Math.floor(input.repeatBlocks ?? 80)))
+  const lines: string[] = []
+  for (let b = 0; b < repeatBlocks; b += 1) {
+    const shuffled = [...paths]
+    shuffleInPlace(shuffled)
+    for (const p of shuffled) {
+      lines.push(`file '${concatFileDirectiveValue(p)}'`)
+    }
+  }
+  const body = `${lines.join('\n')}\n`
+  const name = `ytu-bgm-${randomBytes(8).toString('hex')}.txt`
   const path = join(tmpdir(), name)
   await fsp.writeFile(path, body, 'utf8')
   return path

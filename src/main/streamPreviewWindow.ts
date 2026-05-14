@@ -1,8 +1,12 @@
-import { BrowserWindow } from 'electron'
+import { BrowserWindow, dialog } from 'electron'
+import { resolveAppIconPath } from './appIcon'
 import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+/** Удерживаем ссылку, иначе окно может закрыться до показа (GC). */
+let activeStreamPreviewWindow: BrowserWindow | null = null
 
 function esc(s: string): string {
   return s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')
@@ -24,12 +28,28 @@ export async function openStreamPreviewWindow(input: {
   videoFramePath: string
   overlayFramePath?: string | null
   initialLayoutJson?: string | null
+  previewFocus?: 'stream' | 'bumper'
+  streamerId?: number | null
+  initialStreamMusicVolume?: number
+  initialBumperMusicVolume?: number
+  initialStreamMusicFolder?: string | null
+  initialBumperMusicFolder?: string | null
   onSave?: (layoutJson: string) => void
   onRenderMinute?: (
     layoutJson: string,
     onProgress?: (p: { elapsedSec: number; totalSec: number; remainingSec: number; percent: number }) => void
   ) => Promise<string>
+  onStreamerPatch?: (patch: Record<string, unknown>) => void
 }): Promise<void> {
+  const previewFocus = input.previewFocus === 'bumper' ? 'bumper' : 'stream'
+  const previewCtx = {
+    focus: previewFocus,
+    streamerId: input.streamerId ?? null,
+    streamMusicVol: Math.max(0, Math.min(200, Math.floor(Number(input.initialStreamMusicVolume ?? 100)))),
+    bumperMusicVol: Math.max(0, Math.min(200, Math.floor(Number(input.initialBumperMusicVolume ?? 100)))),
+    streamMusicFolder: String(input.initialStreamMusicFolder ?? '').trim(),
+    bumperMusicFolder: String(input.initialBumperMusicFolder ?? '').trim()
+  }
   const videoUrl = pathToFileURL(input.videoFramePath).toString()
   const overlayUrl = input.overlayFramePath ? pathToFileURL(input.overlayFramePath).toString() : ''
   const initialLayoutEncoded = encodeURIComponent(input.initialLayoutJson ?? '')
@@ -105,10 +125,25 @@ export async function openStreamPreviewWindow(input: {
     <div class="wrap">
       <div class="left">
         <div class="head">
-          <div class="title">Источники</div>
+          <div class="row2" style="align-items:center">
+            <div class="title">Источники</div>
+            <button id="closePreviewBtn" type="button" class="btn-red mini">Закрыть</button>
+          </div>
           <div class="row">
             <label>Масштаб предпросмотра: <span id="previewScaleVal">100%</span></label>
             <input id="previewScale" type="range" min="40" max="170" step="1" value="100" />
+          </div>
+          <div id="musicVolRow" class="row" style="display:none">
+            <label>Громкость фона (музыка): <span id="musicVolVal">100%</span></label>
+            <input id="musicVolSlider" type="range" min="0" max="200" step="1" value="100" />
+          </div>
+          <div id="mainGainRow" class="row" style="display:none">
+            <label><span id="mainGainLabel">Громкость звука кусков</span>: <span id="mainGainVal">100%</span></label>
+            <input id="mainGainSlider" type="range" min="10" max="250" step="1" value="100" />
+          </div>
+          <div id="musicFolderRow" class="row" style="display:none">
+            <button id="pickMusicFolderBtn" type="button">Папка с музыкой…</button>
+            <span id="musicFolderHint" class="muted" style="font-size:11px"></span>
           </div>
           <div class="row2">
             <button id="addTextBtn" type="button">+ Текст</button>
@@ -120,9 +155,7 @@ export async function openStreamPreviewWindow(input: {
           </div>
         </div>
         <div class="sources" id="sourcesList"></div>
-        <div class="foot">
-          <p class="muted">Перетаскивай источники слева мышкой, чтобы менять слой. Двойной клик открывает параметры только у новых элементов.</p>
-        </div>
+        <div class="foot" aria-hidden="true"></div>
       </div>
       <div class="stageWrap">
         <div class="stage" id="stage">
@@ -144,6 +177,7 @@ export async function openStreamPreviewWindow(input: {
       </div>
     </div>
     <script>
+      const PREVIEW_CTX = ${JSON.stringify(previewCtx)}
       const initialLayout = (() => {
         try {
           const raw = ${JSON.stringify(initialLayoutEncoded)}
@@ -172,12 +206,25 @@ export async function openStreamPreviewWindow(input: {
       const editorTitle = document.getElementById('editorTitle')
       const editorBody = document.getElementById('editorBody')
       const editorCloseBtn = document.getElementById('editorCloseBtn')
+      const closePreviewBtn = document.getElementById('closePreviewBtn')
+      const musicVolRow = document.getElementById('musicVolRow')
+      const musicVolSlider = document.getElementById('musicVolSlider')
+      const musicVolVal = document.getElementById('musicVolVal')
+      const mainGainRow = document.getElementById('mainGainRow')
+      const mainGainLabel = document.getElementById('mainGainLabel')
+      const mainGainSlider = document.getElementById('mainGainSlider')
+      const mainGainVal = document.getElementById('mainGainVal')
+      const musicFolderRow = document.getElementById('musicFolderRow')
+      const pickMusicFolderBtn = document.getElementById('pickMusicFolderBtn')
+      const musicFolderHint = document.getElementById('musicFolderHint')
 
       let selectedId = null
       let editingId = null
       let replacingSourceId = null
       let draggingSourceId = null
       let sourceIdSeq = 1000
+      /** true если загрузили сохранённый layout — тогда не двигаем позиции автоматически. */
+      let layoutLoadedFromPreset = false
       const STANDARD_TEXT_FONT = 'Arial'
       let systemFonts = ${JSON.stringify(mainFonts.length ? mainFonts : ['Segoe UI', 'Arial', 'Tahoma', 'Verdana', 'Times New Roman'])}
       const sources = []
@@ -248,6 +295,15 @@ export async function openStreamPreviewWindow(input: {
         src.h = Math.max(24, Math.round(ih * k))
       }
 
+      function centerSourceInStage(s) {
+        const sw = stage.clientWidth || 360
+        const sh = stage.clientHeight || 640
+        const w = Math.max(40, Number(s.w || 0))
+        const h = Math.max(24, Number(s.h || 0))
+        s.x = Math.round((sw - w) / 2)
+        s.y = Math.round((sh - h) / 2)
+      }
+
       function buildTextShadow(t) {
         const s = Math.max(0, Number(t.strokeSize || 0))
         const c = t.strokeColor || '#000000'
@@ -269,6 +325,25 @@ export async function openStreamPreviewWindow(input: {
       }
 
       function initSources() {
+        layoutLoadedFromPreset = false
+        const currentVideoUrl = ${JSON.stringify(videoUrl)}
+        const currentOverlayUrl = ${JSON.stringify(overlayUrl)}
+        /** Сохранённый layout хранит старые file:// на снимки; при смене файла оверлея/видео подставляем актуальные URL из этого окна. */
+        const syncRootMediaUrls = () => {
+          for (const s of sources) {
+            if (!s) continue
+            if (s.id === 'video-root' && currentVideoUrl) {
+              s.src = currentVideoUrl
+              const fp = decodeFileUrlToFsPath(currentVideoUrl)
+              if (fp) s.filePath = fp
+            }
+            if (s.id === 'overlay-root' && currentOverlayUrl) {
+              s.src = currentOverlayUrl
+              const fp = decodeFileUrlToFsPath(currentOverlayUrl)
+              if (fp) s.filePath = fp
+            }
+          }
+        }
         const ensureCoreSources = () => {
           const hasVideo = sources.some((s) => s && s.type === 'video')
           const hasOverlay = sources.some((s) => s && s.type === 'overlay')
@@ -279,7 +354,7 @@ export async function openStreamPreviewWindow(input: {
               name: 'Видео',
               locked: true,
               visible: true,
-              z: 10,
+              z: 20,
               x: 0,
               y: 0,
               w: 360,
@@ -294,7 +369,7 @@ export async function openStreamPreviewWindow(input: {
               name: 'Оверлей',
               locked: true,
               visible: true,
-              z: 20,
+              z: 10,
               x: 12,
               y: 12,
               w: 336,
@@ -310,11 +385,25 @@ export async function openStreamPreviewWindow(input: {
             previewScale.value = String(j.previewScale)
             applyPreviewScale()
           }
+          if (typeof j.mainAudioGainPercent === 'number' && mainGainSlider) {
+            const g = Math.max(10, Math.min(250, Math.round(Number(j.mainAudioGainPercent))))
+            mainGainSlider.value = String(g)
+            if (mainGainVal) mainGainVal.textContent = g + '%'
+          }
+          if (typeof j.previewMusicVolumePercent === 'number' && musicVolSlider && musicVolVal) {
+            const vm = Math.max(0, Math.min(200, Math.round(Number(j.previewMusicVolumePercent))))
+            musicVolSlider.value = String(vm)
+            musicVolVal.textContent = vm + '%'
+            if (PREVIEW_CTX.focus === 'bumper') PREVIEW_CTX.bumperMusicVol = vm
+            else PREVIEW_CTX.streamMusicVol = vm
+          }
           if (Array.isArray(j.sources) && j.sources.length > 0) {
             for (const src of j.sources) {
               if (!src || typeof src !== 'object') continue
               sources.push(normalizeSourceLoadedFromPreset(src))
             }
+            layoutLoadedFromPreset = true
+            syncRootMediaUrls()
             ensureCoreSources()
             if (sources.length > 0) {
               selectedId = sources[0]?.id || null
@@ -323,29 +412,10 @@ export async function openStreamPreviewWindow(input: {
           }
         }
         ensureCoreSources()
-        sources.push({
-          id: mkId('text'),
-          type: 'text',
-          name: 'Текст',
-          locked: false,
-          visible: true,
-          z: 30,
-          x: 40,
-          y: 40,
-          w: 320,
-          h: 80,
-          text: {
-            content: 'Текст поверх стрима',
-            font: 'Arial',
-            fontFilePath: null,
-            size: 42,
-            color: '#ffffff',
-            strokeColor: '#000000',
-            strokeSize: 2,
-            visible: true
-          }
-        })
-        selectedId = sources[0]?.id || null
+        selectedId =
+          sources.find((s) => s && s.type === 'video')?.id ||
+          sources.find((s) => s && s.type === 'overlay')?.id ||
+          null
       }
 
       function serializeLayout() {
@@ -367,6 +437,10 @@ export async function openStreamPreviewWindow(input: {
         }))
         return {
           previewScale: Number(previewScale.value || 100),
+          mainAudioGainPercent: Math.max(10, Math.min(250, Math.round(Number(mainGainSlider ? mainGainSlider.value : 100) || 100))),
+          previewMusicVolumePercent: musicVolSlider
+            ? Math.max(0, Math.min(200, Math.round(Number(musicVolSlider.value) || 0)))
+            : 100,
           sources: outSources
         }
       }
@@ -482,11 +556,14 @@ export async function openStreamPreviewWindow(input: {
             const img = document.createElement('img')
             img.src = toRenderableMediaSrc(s.src || '')
             img.addEventListener('load', () => {
-              if ((s.type === 'video' || s.type === 'overlay') && !s._aspectInited) {
-                s._aspectInited = true
+              if (s.type !== 'video' && s.type !== 'overlay') return
+              if (s._aspectInited) return
+              s._aspectInited = true
+              if (!layoutLoadedFromPreset) {
                 fitByAspect(s, img.naturalWidth, img.naturalHeight)
-                renderAll()
+                centerSourceInStage(s)
               }
+              renderAll()
             }, { once: true })
             el.appendChild(img)
           }
@@ -939,6 +1016,77 @@ export async function openStreamPreviewWindow(input: {
         window.location.href = 'preview-render://run'
       })
 
+      function shortMusicPath(p) {
+        const s = String(p || '').trim()
+        if (!s) return 'не выбрана'
+        const parts = s.split(/[\\\\/]/).filter(Boolean)
+        return (parts.length > 2 ? '…/' : '') + parts.slice(-2).join('/') || s
+      }
+      function applyPreviewAudioUi() {
+        const sid = PREVIEW_CTX.streamerId
+        if (musicVolRow) musicVolRow.style.display = sid ? 'grid' : 'none'
+        if (musicFolderRow) musicFolderRow.style.display = sid ? 'grid' : 'none'
+        if (mainGainRow) mainGainRow.style.display = 'grid'
+        if (mainGainLabel) {
+          mainGainLabel.textContent =
+            PREVIEW_CTX.focus === 'bumper' ? 'Громкость начального видео' : 'Громкость звука кусков'
+        }
+        if (musicVolSlider && musicVolVal) {
+          const v = PREVIEW_CTX.focus === 'bumper' ? PREVIEW_CTX.bumperMusicVol : PREVIEW_CTX.streamMusicVol
+          musicVolSlider.value = String(v)
+          musicVolVal.textContent = v + '%'
+        }
+        if (musicFolderHint) {
+          const f = PREVIEW_CTX.focus === 'bumper' ? PREVIEW_CTX.bumperMusicFolder : PREVIEW_CTX.streamMusicFolder
+          musicFolderHint.textContent = shortMusicPath(f)
+        }
+      }
+      applyPreviewAudioUi()
+      let streamerPatchTimer = null
+      function queueStreamerPatch(patch) {
+        if (!PREVIEW_CTX.streamerId) return
+        window.clearTimeout(streamerPatchTimer)
+        streamerPatchTimer = window.setTimeout(() => {
+          try {
+            window.__previewPendingPayload = JSON.stringify(
+              Object.assign({ streamer_id: PREVIEW_CTX.streamerId }, patch)
+            )
+          } catch {
+            return
+          }
+          window.location.href = 'preview-streamer-sync://push'
+        }, 350)
+      }
+      if (closePreviewBtn) {
+        closePreviewBtn.addEventListener('click', () => {
+          window.location.href = 'preview-close://close'
+        })
+      }
+      if (musicVolSlider && musicVolVal) {
+        musicVolSlider.addEventListener('input', () => {
+          const n = Math.max(0, Math.min(200, Number(musicVolSlider.value) || 0))
+          musicVolVal.textContent = n + '%'
+          if (PREVIEW_CTX.focus === 'bumper') {
+            PREVIEW_CTX.bumperMusicVol = n
+            queueStreamerPatch({ bumper_music_volume: n })
+          } else {
+            PREVIEW_CTX.streamMusicVol = n
+            queueStreamerPatch({ stream_music_volume: n })
+          }
+        })
+      }
+      if (mainGainSlider && mainGainVal) {
+        mainGainSlider.addEventListener('input', () => {
+          const n = Math.max(10, Math.min(250, Number(mainGainSlider.value) || 100))
+          mainGainVal.textContent = n + '%'
+        })
+      }
+      if (pickMusicFolderBtn) {
+        pickMusicFolderBtn.addEventListener('click', () => {
+          window.location.href = 'preview-pick-music://' + encodeURIComponent(PREVIEW_CTX.focus)
+        })
+      }
+
       previewScale.addEventListener('input', applyPreviewScale)
       async function loadSystemFonts() {
         try {
@@ -955,6 +1103,7 @@ export async function openStreamPreviewWindow(input: {
       }
 
       function hardResetDefaultSources() {
+        layoutLoadedFromPreset = false
         sources.length = 0
         sources.push({
           id: 'video-root',
@@ -962,7 +1111,7 @@ export async function openStreamPreviewWindow(input: {
           name: 'Видео',
           locked: true,
           visible: true,
-          z: 10,
+          z: 20,
           x: 0,
           y: 0,
           w: 360,
@@ -976,7 +1125,7 @@ export async function openStreamPreviewWindow(input: {
             name: 'Оверлей',
             locked: true,
             visible: true,
-            z: 20,
+            z: 10,
             x: 12,
             y: 12,
             w: 336,
@@ -984,29 +1133,10 @@ export async function openStreamPreviewWindow(input: {
             src: ${JSON.stringify(overlayUrl)}
           })
         }
-        sources.push({
-          id: mkId('text'),
-          type: 'text',
-          name: 'Текст',
-          locked: false,
-          visible: true,
-          z: 30,
-          x: 40,
-          y: 40,
-          w: 320,
-          h: 80,
-          text: {
-            content: 'Текст поверх стрима',
-            font: 'Arial',
-            fontFilePath: null,
-            size: 42,
-            color: '#ffffff',
-            strokeColor: '#000000',
-            strokeSize: 2,
-            visible: true
-          }
-        })
-        selectedId = sources[0]?.id || null
+        selectedId =
+          sources.find((s) => s && s.type === 'video')?.id ||
+          sources.find((s) => s && s.type === 'overlay')?.id ||
+          null
       }
 
       window.addEventListener('error', (e) => {
@@ -1028,17 +1158,34 @@ export async function openStreamPreviewWindow(input: {
   </body>
 </html>`
 
+  if (activeStreamPreviewWindow && !activeStreamPreviewWindow.isDestroyed()) {
+    activeStreamPreviewWindow.close()
+  }
+
+  const icon = resolveAppIconPath()
   const win = new BrowserWindow({
     width: 1300,
     height: 900,
     minWidth: 980,
     minHeight: 700,
+    show: true,
     backgroundColor: '#0f1115',
     autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true
+    }
+  })
+  activeStreamPreviewWindow = win
+  win.on('closed', () => {
+    if (activeStreamPreviewWindow === win) activeStreamPreviewWindow = null
+  })
+  win.once('ready-to-show', () => {
+    if (!win.isDestroyed()) {
+      win.show()
+      win.focus()
     }
   })
   const htmlPath = join(tmpdir(), `ytu-stream-preview-${Date.now()}.html`)
@@ -1053,6 +1200,62 @@ export async function openStreamPreviewWindow(input: {
     }
   })()`
   win.webContents.on('will-navigate', (event, url) => {
+    if (url.startsWith('preview-close://')) {
+      event.preventDefault()
+      win.close()
+      return
+    }
+    if (url.startsWith('preview-streamer-sync://')) {
+      event.preventDefault()
+      void (async () => {
+        try {
+          const fromWindow = await win.webContents.executeJavaScript(readPendingPayloadJs, true)
+          const raw = String(fromWindow || '')
+          const o = JSON.parse(raw) as Record<string, unknown>
+          input.onStreamerPatch?.(o)
+        } catch {
+          // ignore
+        }
+      })()
+      return
+    }
+    if (url.startsWith('preview-pick-music://')) {
+      event.preventDefault()
+      void (async () => {
+        try {
+          const focusRaw = decodeURIComponent(url.replace(/^preview-pick-music:\/\//, ''))
+          const focus = focusRaw === 'bumper' ? 'bumper' : 'stream'
+          const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
+          const p = r.canceled ? '' : (r.filePaths[0] ?? '')
+          const patch: Record<string, unknown> = {}
+          if (focus === 'bumper') patch.bumper_music_folder_path = p.trim() || null
+          else patch.stream_music_folder_path = p.trim() || null
+          input.onStreamerPatch?.(patch)
+          const shortLabel =
+            !p.trim() ? 'не выбрана' : '…/' + p.split(/[/\\]/).filter(Boolean).slice(-2).join('/')
+          await win.webContents.executeJavaScript(
+            `try {
+              var h = document.getElementById('musicFolderHint');
+              function sp(s) {
+                var t = String(s || '').trim();
+                if (!t) return 'не выбрана';
+                var parts = t.split(/[\\\\/]/).filter(Boolean);
+                return (parts.length > 2 ? '…/' : '') + parts.slice(-2).join('/') || t;
+              }
+              if (h) h.textContent = sp(${JSON.stringify(p)});
+              if (typeof PREVIEW_CTX !== 'undefined') {
+                if (${focus === 'bumper' ? 'true' : 'false'}) PREVIEW_CTX.bumperMusicFolder = ${JSON.stringify(p)};
+                else PREVIEW_CTX.streamMusicFolder = ${JSON.stringify(p)};
+              }
+            } catch (e) { console.error(e); }`,
+            true
+          )
+        } catch {
+          // ignore
+        }
+      })()
+      return
+    }
     if (url.startsWith('preview-save://')) {
       event.preventDefault()
       void (async () => {
@@ -1129,8 +1332,8 @@ export async function openStreamPreviewWindow(input: {
             row.querySelector('.lockChip').textContent = lock ? '🔒' : '';
             return row;
           };
-          list.appendChild(mkRow('Видео', true));
           ${overlayUrl ? `list.appendChild(mkRow('Оверлей', true));` : ''}
+          list.appendChild(mkRow('Видео', true));
           const keep = new Set(['guideV', 'guideH']);
           for (const n of [...stage.children]) if (!keep.has(n.id)) stage.removeChild(n);
           const addImgLayer = (src, x, y, w, h, z) => {
@@ -1146,8 +1349,8 @@ export async function openStreamPreviewWindow(input: {
             d.appendChild(img);
             stage.appendChild(d);
           };
-          addImgLayer(${JSON.stringify(videoUrl)}, 0, 0, 360, 640, 10);
-          ${overlayUrl ? `addImgLayer(${JSON.stringify(overlayUrl)}, 12, 12, 336, 616, 20);` : ''}
+          ${overlayUrl ? `addImgLayer(${JSON.stringify(overlayUrl)}, 12, 12, 336, 616, 10);` : ''}
+          addImgLayer(${JSON.stringify(videoUrl)}, 0, 0, 360, 640, 20);
           return 'fallback-restored';
         } catch (e) {
           return 'fallback-error:' + (e && e.message ? e.message : String(e));

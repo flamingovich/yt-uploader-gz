@@ -280,3 +280,111 @@ export function migrateToV16IfNeeded(db: Database.Database): void {
     db.exec(`ALTER TABLE channels ADD COLUMN stream_preview_layout_json TEXT`)
   }
 }
+
+/** Миграция v17: явный тип стрима (casino / white_prewarm). */
+export function migrateToV17IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'stream_type')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'casino'`)
+  }
+  db.exec(`UPDATE streamers SET stream_type = 'casino' WHERE stream_type NOT IN ('casino', 'white_prewarm') OR stream_type IS NULL`)
+}
+
+/** Миграция v18: отдельный пресет предпросмотра для типа «Прогрев белым». */
+export function migrateToV18IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'stream_preview_layout_white_json')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN stream_preview_layout_white_json TEXT`)
+  }
+}
+
+/** Миграция v19: пресет предпросмотра начальной сцены (бампер) на канале. */
+export function migrateToV19IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  if (!chCols.some((c) => c.name === 'stream_preview_bumper_layout_json')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN stream_preview_bumper_layout_json TEXT`)
+  }
+}
+
+/** Миграция v20: начальная сцена — опция «без звука». */
+export function migrateToV20IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'bumper_mute_audio')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN bumper_mute_audio INTEGER NOT NULL DEFAULT 0`)
+  }
+}
+
+/** Миграция v21: оверлей начальной сцены (PNG / видео). */
+export function migrateToV21IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'bumper_overlay_path')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN bumper_overlay_path TEXT`)
+  }
+}
+
+/** Миграция v22: фоновая музыка для эфира и начальной сцены (папка + громкость 0–200%). */
+export function migrateToV22IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'stream_music_folder_path')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_music_folder_path TEXT`)
+  }
+  if (!cols.some((c) => c.name === 'stream_music_volume')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_music_volume INTEGER NOT NULL DEFAULT 100`)
+  }
+  if (!cols.some((c) => c.name === 'bumper_music_folder_path')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN bumper_music_folder_path TEXT`)
+  }
+  if (!cols.some((c) => c.name === 'bumper_music_volume')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN bumper_music_volume INTEGER NOT NULL DEFAULT 100`)
+  }
+}
+
+/** Миграция v23: окно публикации в минутах от полуночи (точные :mm), совместимо со старыми часами. */
+export function migrateToV23IfNeeded(db: Database.Database): void {
+  const chCols = pragmaTableInfo(db, 'channels')
+  const has = (name: string): boolean => chCols.some((c) => c.name === name)
+  if (!has('schedule_window_start_mins')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN schedule_window_start_mins INTEGER`)
+  }
+  if (!has('schedule_window_end_mins')) {
+    db.exec(`ALTER TABLE channels ADD COLUMN schedule_window_end_mins INTEGER`)
+  }
+  db.exec(`
+    UPDATE channels
+    SET schedule_window_start_mins = schedule_window_start_hour * 60
+    WHERE schedule_window_start_mins IS NULL
+  `)
+  db.exec(`
+    UPDATE channels
+    SET schedule_window_end_mins = schedule_window_end_hour * 60 + 59
+    WHERE schedule_window_end_mins IS NULL
+  `)
+}
+
+/** Миграция v24: разрешение и FPS выходного RTMP-потока (Shorts 720×1280 / 900×1600 / 1080×1920). */
+export function migrateToV24IfNeeded(db: Database.Database): void {
+  const cols = pragmaTableInfo(db, 'streamers')
+  if (!cols.some((c) => c.name === 'stream_output_width')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_output_width INTEGER NOT NULL DEFAULT 1080`)
+  }
+  if (!cols.some((c) => c.name === 'stream_output_height')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_output_height INTEGER NOT NULL DEFAULT 1920`)
+  }
+  if (!cols.some((c) => c.name === 'stream_video_fps')) {
+    db.exec(`ALTER TABLE streamers ADD COLUMN stream_video_fps INTEGER NOT NULL DEFAULT 30`)
+  }
+  db.exec(`
+    UPDATE streamers
+    SET stream_output_width = 1080, stream_output_height = 1920
+    WHERE NOT (
+      (stream_output_width = 720 AND stream_output_height = 1280)
+      OR (stream_output_width = 900 AND stream_output_height = 1600)
+      OR (stream_output_width = 1080 AND stream_output_height = 1920)
+    )
+  `)
+  db.exec(`
+    UPDATE streamers
+    SET stream_video_fps = 30
+    WHERE stream_video_fps NOT IN (24, 30, 50, 60)
+  `)
+}

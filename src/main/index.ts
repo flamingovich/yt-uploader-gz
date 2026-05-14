@@ -59,6 +59,11 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  const appIcon = resolveAppIconPath()
+  if (process.platform === 'darwin' && appIcon) {
+    app.dock.setIcon(appIcon)
+  }
+
   initDatabase(getDbPath())
   registerIpcHandlers()
   createWindow()

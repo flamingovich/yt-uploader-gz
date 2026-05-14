@@ -44,19 +44,19 @@ function ProxyCountryFlagImg(props: { code: string; title: string; className?: s
   if (failed) {
     return (
       <span title={props.title} className={props.className}>
-        <Globe className="h-5 w-5 shrink-0 text-industrial-muted" strokeWidth={1.75} aria-hidden />
+        <Globe className="h-3.5 w-3.5 shrink-0 text-industrial-muted" strokeWidth={1.75} aria-hidden />
       </span>
     )
   }
   return (
     <img
-      src={`https://flagcdn.com/24x18/${lc}.png`}
-      srcSet={`https://flagcdn.com/48x36/${lc}.png 2x`}
-      width={24}
-      height={18}
+      src={`https://flagcdn.com/16x12/${lc}.png`}
+      srcSet={`https://flagcdn.com/32x24/${lc}.png 2x`}
+      width={16}
+      height={12}
       alt=""
       title={props.title}
-      className={`h-[18px] w-6 shrink-0 rounded-sm border border-industrial-border/50 object-cover ${props.className ?? ''}`}
+      className={`h-3 w-4 shrink-0 rounded-sm border border-industrial-border/50 object-cover ${props.className ?? ''}`}
       loading="lazy"
       decoding="async"
       onError={() => setFailed(true)}
@@ -70,7 +70,7 @@ export function ProxyStatusGlyph(props: { lastCheckStatus: string | null; classN
   if (p.state === 'unknown') {
     return (
       <span
-        className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded border border-industrial-border/60 bg-industrial-bg text-[10px] text-industrial-dim ${base}`}
+        className={`inline-flex h-3.5 w-4 shrink-0 items-center justify-center rounded border border-industrial-border/60 bg-industrial-bg text-[9px] text-industrial-dim ${base}`}
         title="Прокси ещё не проверяли"
       >
         …
@@ -80,7 +80,7 @@ export function ProxyStatusGlyph(props: { lastCheckStatus: string | null; classN
   if (p.state === 'fail') {
     return (
       <span className={`inline-flex shrink-0 items-center justify-center ${base}`} title={p.error}>
-        <AlertCircle className="h-5 w-5 text-red-400" strokeWidth={2} aria-hidden />
+        <AlertCircle className="h-3.5 w-3.5 text-red-400" strokeWidth={2} aria-hidden />
       </span>
     )
   }
@@ -93,7 +93,7 @@ export function ProxyStatusGlyph(props: { lastCheckStatus: string | null; classN
   }
   return (
     <span className={`inline-flex shrink-0 text-sm leading-none text-industrial-muted ${base}`} title={p.country}>
-      <Globe className="h-5 w-5" strokeWidth={1.5} aria-hidden />
+      <Globe className="h-3.5 w-3.5" strokeWidth={1.5} aria-hidden />
     </span>
   )
 }
